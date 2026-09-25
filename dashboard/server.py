@@ -13,12 +13,14 @@ Endpoints
   POST /api/cases/{id}/summary      plain-English explanation of a decision
   DELETE /api/cases                 clear the case store
   POST /api/runs                    run sample / backend deliveries in the background
+                                    (on Vercel the run finishes before the response)
   GET  /api/runs/{run_id}           run progress
   POST /api/chat                    ask the Operations Copilot anything
   POST /api/chat/stream             same, streamed as Server-Sent Events
   POST /api/exceptions/analyze      Tier-2 RAG analysis of a driver exception note
   WS   /ws                          live events (case_started, case_completed, run_*)
 """
+import os
 import time
 import uuid
 import json
@@ -259,7 +261,15 @@ async def start_run(req: RunRequest) -> Dict[str, Any]:
     task = asyncio.create_task(execute())
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    if _sync_runs():
+        await task
     return run
+
+
+def _sync_runs() -> bool:
+    """Serverless hosts (Vercel) may pause work after the response and have no WebSockets,
+    so there the run completes inside the request. VENLIX_SYNC_RUNS=1 forces this anywhere."""
+    return bool(os.getenv("VERCEL")) or os.getenv("VENLIX_SYNC_RUNS") == "1"
 
 
 @app.get("/api/runs/{run_id}")

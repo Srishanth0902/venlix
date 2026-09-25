@@ -1,5 +1,6 @@
 """Dashboard HTTP / WebSocket API."""
 import json
+import os
 import time
 
 import pytest
@@ -51,6 +52,24 @@ def test_sample_run_populates_cases_and_stats(api):
 
     assert api.delete("/api/cases").json()["deleted"] == 6
     assert api.get("/api/cases").json()["cases"] == []
+
+
+def test_runs_finish_within_the_request_on_vercel(api, monkeypatch):
+    # Serverless functions have no WebSockets and may pause after responding.
+    monkeypatch.setenv("VERCEL", "1")
+    run = api.post("/api/runs", json={"source": "sample"}).json()
+    assert run["status"] == "completed" and run["completed"] == 6
+    assert len(api.get("/api/cases").json()["cases"]) == 6
+
+
+def test_case_store_uses_tmp_on_vercel(monkeypatch):
+    import tempfile
+    from delivery_agent import store
+
+    monkeypatch.delenv("VENLIX_DB_PATH", raising=False)
+    monkeypatch.setenv("VERCEL", "1")
+    store.reset_singletons()
+    assert store.get_store().path == os.path.join(tempfile.gettempdir(), "venlix_agent.db")
 
 
 def test_backend_run_uses_sample_data_when_backend_is_down(api):
