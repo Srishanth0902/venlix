@@ -13,7 +13,6 @@ When the backend is unreachable, seeded sample data is returned and flagged via
 get_backend_status() so answers can say the data is not live.
 """
 
-import os
 import re
 import copy
 import time
@@ -21,13 +20,14 @@ import logging
 import threading
 from typing import Dict, Any, List, Optional, Callable, Iterable
 import requests
+from ..env_utils import env_float, env_str
 
 logger = logging.getLogger(__name__)
 
-BACKEND_BASE_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
-BACKEND_TIMEOUT = float(os.getenv("BACKEND_TIMEOUT", "3.0"))
-BACKEND_CACHE_TTL = float(os.getenv("BACKEND_CACHE_TTL", "15"))
-BACKEND_RETRY_AFTER = float(os.getenv("BACKEND_RETRY_AFTER", "30"))
+BACKEND_BASE_URL = env_str("BACKEND_URL", "http://127.0.0.1:8000")
+BACKEND_TIMEOUT = env_float("BACKEND_TIMEOUT", 3.0)
+BACKEND_CACHE_TTL = env_float("BACKEND_CACHE_TTL", 15.0)
+BACKEND_RETRY_AFTER = env_float("BACKEND_RETRY_AFTER", 30.0)
 
 _session = requests.Session()
 _cache: Dict[str, Any] = {}

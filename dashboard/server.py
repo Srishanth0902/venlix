@@ -29,8 +29,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="Venlix Agent Dashboard", version="1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.exception_handler(Exception)
+async def unhandled_error(request: Request, err: Exception) -> JSONResponse:
+    """Name the error instead of a bare "Internal Server Error" (the dashboard shows `detail`)."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": f"{type(err).__name__}: {err}"})
 
 _runs: Dict[str, Dict[str, Any]] = {}
 _background_tasks: Set[asyncio.Task] = set()

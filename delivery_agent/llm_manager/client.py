@@ -32,6 +32,7 @@ load_dotenv()
 from . import offline
 from .copilot import process_copilot_request
 from .prompts import COPILOT_SYSTEM_PROMPT, COPILOT_DATA_PROMPT
+from ..env_utils import env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ def _build_request(prompt: str, system: Optional[str], use_tools: bool) -> Dict[
 
 
 def _trim_history(history: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
-    limit = int(_env("LLM_MAX_HISTORY", "12"))
+    limit = env_int("LLM_MAX_HISTORY", 12)
     cleaned = [
         {"role": "assistant" if m.get("role") in ("assistant", "model") else "user", "content": str(m.get("content", ""))}
         for m in (history or [])
@@ -278,7 +279,7 @@ def _gemini_config(system: Optional[str], max_tokens: int, timeout: float, tempe
     # and add seconds of latency, which truncated or emptied short answers. Disable it
     # unless the operator opts in (GEMINI_THINKING_BUDGET=auto or a token budget).
     if thinking and _thinking_off_requested():
-        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=int(_env("GEMINI_THINKING_BUDGET", "0")))
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=env_int("GEMINI_THINKING_BUDGET", 0))
     return types.GenerateContentConfig(**kwargs)
 
 
@@ -364,7 +365,7 @@ def _gemini_try_models(task: Optional[str], meta: Dict[str, Any], attempt_fn: Ca
                         raise RuntimeError("; ".join(errors)) from err
                     break
         if round_no == 0 and errors and all_overloaded:
-            time.sleep(float(_env("GEMINI_RETRY_DELAY", "0.8")))
+            time.sleep(env_float("GEMINI_RETRY_DELAY", 0.8))
             continue
         break
     raise RuntimeError("; ".join(errors) or "No Gemini model available.")
