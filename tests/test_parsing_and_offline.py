@@ -101,3 +101,18 @@ def test_offline_answers_are_grounded_and_honest():
     # "this" contains "hi" but is not a greeting; open questions get an honest notice
     general = answer_question("Explain this: why is the sky blue?", {})
     assert "offline mode" in general and "Hello" not in general
+
+
+def test_clear_replies_skip_the_llm_but_hedged_ones_do_not(monkeypatch):
+    from delivery_agent.llm_manager import customer_comm
+    calls = []
+
+    def fake_llm(*args, **kwargs):
+        calls.append(kwargs.get("task"))
+        return '{"wants_reschedule": false, "new_slot": null, "declined": false}'
+
+    monkeypatch.setattr(customer_comm, "call_llm", fake_llm)
+    assert parse_customer_reply("Yes, 5 PM works for me")["wants_reschedule"] is True
+    assert calls == []
+    parse_customer_reply("Maybe, if the driver can come after 6")
+    assert calls == ["reply_parse"]

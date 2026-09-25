@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 SMS_WORD_LIMIT = 45
 
+# Words that make a reply ambiguous enough to need the LLM parser.
+_HEDGE = re.compile(r"\b(maybe|perhaps|not sure|unsure|depends|unless|if|but|however|although|might|probably|either|or)\b",
+                    re.IGNORECASE)
+
 _ASCII_MAP = str.maketrans({
     "‘": "'", "’": "'", "“": '"', "”": '"',
     "–": "-", "—": "-", "…": "...", " ": " ",
@@ -147,6 +151,12 @@ def parse_customer_reply(text: str, timeout: float = 6.0) -> Dict[str, Any]:
     """
     if not text or not text.strip():
         return {"wants_reschedule": False, "new_slot": None, "declined": False}
+
+    # Clear, short replies ("Yes, 5 PM works", "No, cancel it") are parsed locally: it is instant
+    # and saves an LLM call (and quota) per case. Hedged or long replies still go to the LLM.
+    quick = parse_reply_keywords(text)
+    if (quick["wants_reschedule"] or quick["declined"]) and len(text.split()) <= 25 and not _HEDGE.search(text):
+        return quick
 
     user_prompt = REPLY_PARSE_USER_PROMPT.format(reply_text=text.strip())
 
