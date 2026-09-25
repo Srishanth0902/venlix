@@ -479,10 +479,24 @@ async function startRun(source) {
     state.run = run;
     renderRun();
     if (!run.total) { buttons.forEach((b) => { b.disabled = false; }); }
+    else if (!wsOpen) await followRun(run);
   } catch (e) {
     toast(`Could not start run: ${e.message}`);
     buttons.forEach((b) => { b.disabled = false; });
   }
+}
+// Without live updates (e.g. on serverless hosting, which has no WebSockets) poll the run instead.
+async function followRun(run) {
+  let current = run;
+  while (current.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    try { current = await api(`/api/runs/${encodeURIComponent(current.run_id)}`); } catch (e) { break; }
+    state.run = current;
+    renderRun();
+  }
+  [$("#run-sample"), $("#run-backend")].forEach((b) => { b.disabled = false; });
+  addActivity(`Run finished: ${current.completed} cases${current.duration_ms != null ? ` in ${fmt.ms(current.duration_ms)}` : ""}`);
+  await Promise.all([refreshCases(), refreshStats()]);
 }
 function renderRun() {
   const run = state.run;
@@ -501,14 +515,15 @@ $("#run-backend").addEventListener("click", () => startRun("backend"));
 // Live updates (WebSocket with reconnect)
 // ---------------------------------------------------------------------------
 let wsRetry = 0;
+let wsOpen = false;
 function connectWs() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   const setLive = (ok) => {
     $("#live-pill .dot").className = `dot ${ok ? "good" : "critical"}`;
     $("#live-pill").title = ok ? "Live updates connected" : "Live updates disconnected - reconnecting";
   };
-  ws.onopen = () => { wsRetry = 0; setLive(true); };
-  ws.onclose = () => { setLive(false); setTimeout(connectWs, Math.min(10000, 500 * 2 ** wsRetry++)); };
+  ws.onopen = () => { wsRetry = 0; wsOpen = true; setLive(true); };
+  ws.onclose = () => { wsOpen = false; setLive(false); setTimeout(connectWs, Math.min(10000, 500 * 2 ** wsRetry++)); };
   ws.onmessage = (msg) => {
     let ev;
     try { ev = JSON.parse(msg.data); } catch (e) { return; }

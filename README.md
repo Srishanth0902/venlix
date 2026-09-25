@@ -87,6 +87,20 @@ Live updates arrive over a WebSocket (`/ws`); the REST API is listed in `dashboa
   An outage degrades an answer instead of failing it.
 - **The compiled graph is reused.** ChromaDB loads only on first use.
 
+## Deploying to Vercel
+
+Import the repository in Vercel. It detects FastAPI through `main.py`, so no build settings are needed. Optionally add
+`GEMINI_API_KEY` and/or `OPENROUTER_API_KEY` as environment variables; without them the offline engine answers.
+
+Serverless functions differ from a normal server, and the app adapts when Vercel's `VERCEL` variable is set:
+
+- **No WebSockets:** the dashboard polls for results instead, and the "Live" indicator stays red.
+- **Runs finish inside the request**, because a function can be paused after it responds.
+- **Cases live in SQLite under `/tmp`**, per function instance, so they reset when Vercel recycles the instance.
+
+For the full experience (live feed, persistent cases), run it on a host with a long-running process, such as Render or
+Railway: `uvicorn dashboard.server:app --host 0.0.0.0 --port $PORT`.
+
 ## Configuration
 
 See [`.env.example`](.env.example). The main settings:

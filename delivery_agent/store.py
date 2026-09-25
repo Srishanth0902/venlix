@@ -10,6 +10,7 @@ import os
 import json
 import sqlite3
 import asyncio
+import tempfile
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -126,11 +127,18 @@ _bus: Optional[EventBus] = None
 _singleton_lock = threading.Lock()
 
 
+def default_db_path() -> str:
+    """venlix_agent.db locally; on Vercel only /tmp is writable (and it is per instance)."""
+    if os.getenv("VERCEL"):
+        return os.path.join(tempfile.gettempdir(), "venlix_agent.db")
+    return "venlix_agent.db"
+
+
 def get_store() -> CaseStore:
     global _store
     with _singleton_lock:
         if _store is None:
-            _store = CaseStore(os.getenv("VENLIX_DB_PATH", "venlix_agent.db"))
+            _store = CaseStore(os.getenv("VENLIX_DB_PATH") or default_db_path())
         return _store
 
 
