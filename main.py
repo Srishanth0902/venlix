@@ -1,6 +1,6 @@
 """Vercel entrypoint: Vercel serves the FastAPI `app` it finds in main.py (run locally with `python -m dashboard`)."""
 try:
-    from dashboard.server import app  # noqa: F401
+    from dashboard.server import app as _dashboard_app
 except Exception:  # only when the deployment is broken: show why instead of an opaque 500
     import sys
     import traceback
@@ -8,7 +8,7 @@ except Exception:  # only when the deployment is broken: show why instead of an 
     STARTUP_ERROR = traceback.format_exc()
     print(STARTUP_ERROR, file=sys.stderr)
 
-    async def app(scope, receive, send):
+    async def _dashboard_app(scope, receive, send):
         if scope["type"] == "lifespan":
             while True:
                 message = await receive()
@@ -21,3 +21,6 @@ except Exception:  # only when the deployment is broken: show why instead of an 
         await send({"type": "http.response.start", "status": 500,
                     "headers": [(b"content-type", b"text/plain; charset=utf-8")]})
         await send({"type": "http.response.body", "body": body})
+
+# A plain top-level assignment, so Vercel's build finds the entrypoint.
+app = _dashboard_app
