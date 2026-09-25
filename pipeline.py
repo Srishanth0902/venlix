@@ -1,41 +1,46 @@
 import asyncio
-import json
-from delivery_agent.graph import create_delivery_graph
-from delivery_agent.state import DeliveryCase
+import time
+from delivery_agent.mapping import map_to_delivery_case, is_at_risk
+from delivery_agent.runner import run_cases
 from delivery_agent.llm_manager.copilot import get_deliveries
+from delivery_agent.llm_manager.client import get_provider_status
 
-def map_ml_to_delivery_case(ml_data: dict, index: int) -> DeliveryCase:
-    return {
-        "delivery_id": ml_data.get("delivery_id", f"DEL-{ml_data.get('id', index)}"),
-        "customer_id": ml_data.get("customer", {}).get("customer_id", f"CUST-00{ml_data.get('id', index)}"),
-        "driver_id": ml_data.get("driver", {}).get("driver_id", f"DRV-00{ml_data.get('id', index)}"),
-        "risk_score": ml_data.get("risk_score", 0.0),
-        "risk_reason": [rf.get("reason", "") for rf in ml_data.get("risk_factors", [])],
-        "failure_type": None,
-        "store_location": ml_data.get("store"),
-        "drop_location": ml_data.get("drop"),
-        "driver": ml_data.get("driver"),
-        "customer": ml_data.get("customer"),
-        "environment": ml_data.get("environment"),
-        "risk_factors": ml_data.get("risk_factors"),
-        "ai_recommendation": ml_data.get("ai_recommendation"),
-        "customer_context": {},
-        "driver_context": {},
-        "resolution_path": "",
-        "customer_message": None,
-        "customer_reply": None,
-        "final_outcome": None,
-        "savings": {},
-        "status": "pending",
-        "llm_metadata": None,
-        "trace": []
-    }
 
-async def process_deliveries():
+def map_ml_to_delivery_case(ml_data: dict, index: int):
+    """Backwards-compatible alias for the shared ingest mapper."""
+    return map_to_delivery_case(ml_data, index, source="backend")
+
+
+def print_case(final_state: dict) -> None:
+    print(f"--- Delivery {final_state.get('delivery_id')} (Risk Score: {final_state.get('risk_score', 0):.2f}) ---")
+    print(f"FINAL STATUS: {final_state.get('status')}")
+    print(f"FINAL OUTCOME: {final_state.get('final_outcome')}")
+    print(f"FAILURE TYPE: {final_state.get('failure_type')}")
+    print(f"RESOLUTION PATH: {final_state.get('resolution_path')} - {final_state.get('resolution_detail')}")
+
+    if final_state.get("customer_message"):
+        print(f"[LLM] DRAFTED SMS TO CUSTOMER: '{final_state.get('customer_message')}'")
+    if final_state.get("customer_reply"):
+        print(f"[LLM] SIMULATED CUSTOMER REPLY: '{final_state.get('customer_reply')}'")
+    if final_state.get("customer_intent"):
+        print(f"[LLM] PARSED INTENT: {final_state.get('customer_intent')}")
+
+    print("\nTRACE:")
+    for t in final_state.get("trace", []):
+        timing = f" ({t['ms']:.0f} ms)" if t.get("ms") is not None else ""
+        print(f"  [{t.get('node')}] {t.get('action')}{timing}")
+        if "error" in t:
+            print(f"      ERROR: {t['error']}")
+    print(f"Case completed in {final_state.get('duration_ms') or 0:.0f} ms")
+    print("-" * 60 + "\n")
+
+
+async def process_deliveries(concurrency: int = 4):
     print("=" * 60)
     print("STEP 4: Predict + dispatch")
     print("=" * 60)
-    
+    print(f"LLM provider chain: {get_provider_status()['chain']}")
+
     # Dynamically extract data from the backend
     try:
         backend_data = get_deliveries()
@@ -45,40 +50,18 @@ async def process_deliveries():
         return
 
     # 1. Filter the high-risk deliveries
-    at_risk_deliveries = [d for d in backend_data if d.get("prediction") == "Delivery Failure" or d.get("risk_score", 0) > 0.8]
+    at_risk_deliveries = [d for d in backend_data if is_at_risk(d)]
     print(f"Found {len(at_risk_deliveries)} deliveries at risk out of {len(backend_data)} total.\n")
-    
-    graph = create_delivery_graph()
-    
-    # 2. Dispatch them to the Multi-agent
-    for i, ml_delivery in enumerate(at_risk_deliveries):
-        print(f"--- Dispatching Delivery {ml_delivery.get('id', i)} (Risk Score: {ml_delivery.get('risk_score', 0)}) ---")
-        
-        initial_state = map_ml_to_delivery_case(ml_delivery, i)
-        
-        # Run graph
-        final_state = await graph.ainvoke(initial_state)
-        
-        print(f"\nFINAL STATUS: {final_state.get('status')}")
-        print(f"FINAL OUTCOME: {final_state.get('final_outcome')}")
-        print(f"RESOLUTION PATH: {final_state.get('resolution_path')}")
-        
-        if final_state.get("problem_prompt"):
-            print(f"\n[AGENT] GENERATED PROBLEM PROMPT: '{final_state.get('problem_prompt')}'")
-        if final_state.get("customer_message"):
-            print(f"[LLM] DRAFTED SMS TO CUSTOMER: '{final_state.get('customer_message')}'")
-        if final_state.get("customer_reply"):
-            print(f"[LLM] SIMULATED CUSTOMER REPLY: '{final_state.get('customer_reply')}'")
-        
-        print("\nTRACE:")
-        for t in final_state.get("trace", []):
-            print(f"  [{t.get('node')}] {t.get('action')}")
-            if "error" in t:
-                print(f"      ERROR: {t['error']}")
-            
-        print("-" * 60 + "\n")
-        
-        print("STEP 9 & 10: broadcast_ws() -> Live UI Update triggered!\n")
+
+    # 2. Dispatch them to the Multi-agent (concurrently; results print in order)
+    cases = [map_to_delivery_case(d, i, source="backend") for i, d in enumerate(at_risk_deliveries)]
+    started = time.perf_counter()
+    results = await run_cases(cases, concurrency=concurrency)
+    for final_state in results:
+        print_case(final_state)
+    print(f"Processed {len(results)} cases in {(time.perf_counter() - started) * 1000:.0f} ms "
+          f"(concurrency={concurrency}).")
+    print("STEP 9 & 10: broadcast_ws() -> Live UI Update triggered!\n")
 
 if __name__ == "__main__":
     asyncio.run(process_deliveries())

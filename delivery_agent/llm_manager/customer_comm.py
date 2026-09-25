@@ -3,6 +3,7 @@ Customer Communication Module (Tier 1).
 
 Implements:
 - draft_customer_message(case: DeliveryCase | dict) -> str
+- simulate_customer_reply(drafted_message: str) -> str
 - parse_customer_reply(text: str) -> dict
 """
 import re
@@ -12,86 +13,131 @@ from typing import Union, Dict, Any, Optional
 
 from .models import DeliveryCase
 from .client import call_llm
+from .offline import parse_reply_keywords
 from .prompts import (
     CUSTOMER_DRAFT_SYSTEM_PROMPT,
     CUSTOMER_DRAFT_USER_PROMPT,
+    CUSTOMER_REPLY_SIM_SYSTEM_PROMPT,
+    CUSTOMER_REPLY_SIM_USER_PROMPT,
     REPLY_PARSE_SYSTEM_PROMPT,
     REPLY_PARSE_USER_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
 
-def draft_customer_message(case: Union[DeliveryCase, Dict[str, Any]]) -> str:
-    """
-    Turns a DeliveryCase into a friendly SMS-style message.
-    System prompt fixes tone ('friendly, concise, one question at a time') and forces short output (<40 words).
-    """
-    if isinstance(case, dict):
-        case_obj = DeliveryCase.from_dict(case)
-    else:
-        case_obj = case
+SMS_WORD_LIMIT = 45
 
-    user_prompt = CUSTOMER_DRAFT_USER_PROMPT.format(
+_ASCII_MAP = str.maketrans({
+    "‘": "'", "’": "'", "“": '"', "”": '"',
+    "–": "-", "—": "-", "…": "...", " ": " ",
+})
+
+
+def _to_ascii(text: str) -> str:
+    """SMS gateways mangle smart punctuation and emojis; normalise to plain ASCII."""
+    text = text.translate(_ASCII_MAP).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_tagged(raw: str, tag: str) -> Optional[str]:
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", raw, re.DOTALL | re.IGNORECASE)
+    if match and match.group(1).strip():
+        return match.group(1).strip()
+    return None
+
+
+def _usable_untagged(raw: str, max_words: int) -> Optional[str]:
+    """Accept an untagged answer only if it looks like the message itself, not a ramble."""
+    cleaned = re.sub(r"</?\w+>", "", raw).strip().strip('"\'')
+    if cleaned and len(cleaned.split()) <= max_words and "\n\n" not in cleaned:
+        return cleaned
+    return None
+
+
+def build_draft_prompt(case_obj: DeliveryCase) -> str:
+    """The exact user prompt sent to the LLM for an SMS draft."""
+    metadata = case_obj.metadata or {}
+    return CUSTOMER_DRAFT_USER_PROMPT.format(
         customer_name=case_obj.customer_name,
         failure_type=case_obj.failure_type,
         driver_context=case_obj.driver_context,
+        risk_details=metadata.get("risk_details") or "None",
+        recommended_action=metadata.get("recommended_action") or "None",
         proposed_slot=case_obj.proposed_slot,
     )
 
-    raw_response = call_llm(
-        prompt=user_prompt,
-        system=CUSTOMER_DRAFT_SYSTEM_PROMPT,
-        max_tokens=150,
-        timeout=5.0
-    )
 
-    # Post-processing: clean up quotes, extra whitespace, enforce word limit (<40 words)
-    cleaned = raw_response.strip().strip('"\'')
-    words = cleaned.split()
-    if len(words) > 42:
-        # Gracefully trim to stay within ~40 words while keeping sentences clean
-        cleaned = " ".join(words[:40]) + ("?" if "?" in raw_response else ".")
+def draft_customer_message(case: Union[DeliveryCase, Dict[str, Any]], timeout: float = 8.0) -> str:
+    """
+    Turns a DeliveryCase into a friendly SMS-style message.
+    System prompt fixes tone ('friendly, concise, one question at a time') and forces short output (<40 words).
+    Optional case.metadata keys: risk_details, recommended_action.
+    """
+    case_obj = DeliveryCase.from_dict(case) if isinstance(case, dict) else case
 
-    return cleaned
+    try:
+        raw_response = call_llm(
+            prompt=build_draft_prompt(case_obj),
+            system=CUSTOMER_DRAFT_SYSTEM_PROMPT,
+            max_tokens=200,
+            timeout=timeout,
+            task="sms_draft",
+        )
+    except Exception as err:
+        # A dead LLM must not stop the customer from being contacted
+        logger.error(f"SMS draft LLM call failed ({err}); using template.")
+        raw_response = ""
 
-def simulate_customer_reply(drafted_message: str) -> str:
+    sms = _extract_tagged(raw_response, "sms") or _usable_untagged(raw_response, 60)
+    if not sms:
+        logger.warning("SMS draft was unusable; using template.")
+        sms = (f"Hi {case_obj.customer_name}, we hit an issue with your delivery ({case_obj.failure_type}). "
+               f"Can we reschedule for {case_obj.proposed_slot}?")
+
+    sms = _to_ascii(sms)
+    words = sms.split()
+    if len(words) > SMS_WORD_LIMIT:
+        # Gracefully trim to stay within the limit while keeping the question
+        sms = " ".join(words[:SMS_WORD_LIMIT - 1]).rstrip(",;:") + ("?" if "?" in sms else ".")
+    return sms
+
+
+def simulate_customer_reply(drafted_message: str, timeout: float = 8.0) -> str:
     """
     Autonomously generates a realistic fake customer reply to a drafted SMS message.
     Used to make the multi-agent test fully dynamic.
     """
-    user_prompt = (
-        f"SMS RECEIVED: '{drafted_message}'\n\n"
-        f"Write a 1-sentence reply as the customer. Be creative. "
-        f"You might be annoyed by a delay or happy for the update.\n\n"
-        f"IMPORTANT: Use ONLY standard ASCII characters. Do not use smart quotes, em-dashes, or emojis.\n"
-        f"You MUST wrap your final reply inside <reply> and </reply> tags.\n"
-        f"Example:\n"
-        f"<reply>Sure, 5 PM works for me.</reply>"
-    )
-    system_prompt = "You are a customer. STRICTLY NO EXPLANATIONS. NO CHAIN OF THOUGHT. Use standard ASCII. Output ONLY the <reply>...</reply> tag and nothing else."
-    
     try:
         raw_response = call_llm(
-            prompt=user_prompt,
-            system=system_prompt,
-            max_tokens=600,
-            timeout=20.0
+            prompt=CUSTOMER_REPLY_SIM_USER_PROMPT.format(message=drafted_message),
+            system=CUSTOMER_REPLY_SIM_SYSTEM_PROMPT,
+            max_tokens=120,
+            timeout=timeout,
+            task="customer_reply_sim",
+            temperature=0.9,
         )
-        
-        import re
-        match = re.search(r"<reply>(.*?)</reply>", raw_response, re.DOTALL | re.IGNORECASE)
-        if match:
-            reply = match.group(1).strip()
-        else:
-            # Fallback to prevent rambling
-            reply = "Sure, 5 PM works for me."
-            
-        return reply
+        reply = _extract_tagged(raw_response, "reply") or _usable_untagged(raw_response, 40)
+        return _to_ascii(reply) if reply else "Sure, that works for me."
     except Exception as e:
         logger.error(f"Failed to simulate reply: {e}")
         return "I can't take it right now, please come tomorrow."
 
-def parse_customer_reply(text: str) -> Dict[str, Any]:
+
+def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
+    cleaned = raw.strip()
+    if "```" in cleaned:
+        cleaned = re.sub(r"```(?:json)?", "", cleaned)
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def parse_customer_reply(text: str, timeout: float = 6.0) -> Dict[str, Any]:
     """
     Turns freeform customer reply text into structured intent dictionary:
     {"wants_reschedule": bool, "new_slot": str|None, "declined": bool}
@@ -109,67 +155,26 @@ def parse_customer_reply(text: str) -> Dict[str, Any]:
             prompt=user_prompt,
             system=REPLY_PARSE_SYSTEM_PROMPT,
             max_tokens=100,
-            timeout=4.0
+            timeout=timeout,
+            task="reply_parse",
+            temperature=0.0,
         )
-        
-        # Clean JSON markdown if wrapped in ```json ... ```
-        cleaned_str = raw_response.strip()
-        if "```json" in cleaned_str:
-            cleaned_str = cleaned_str.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned_str:
-            cleaned_str = cleaned_str.split("```")[1].split("```")[0].strip()
-
-        data = json.loads(cleaned_str)
-
-        # Validate schema keys
-        if isinstance(data, dict) and "wants_reschedule" in data and "declined" in data:
+        data = _extract_json_object(raw_response)
+        if data and "wants_reschedule" in data and "declined" in data:
             return {
                 "wants_reschedule": bool(data.get("wants_reschedule")),
-                "new_slot": data.get("new_slot") if data.get("new_slot") else None,
+                "new_slot": data.get("new_slot") or None,
                 "declined": bool(data.get("declined"))
             }
-        else:
-            logger.warning("LLM response did not match schema. Executing keyword matching fallback.")
-            return _parse_reply_keyword_fallback(text)
-
+        logger.warning("LLM response did not match schema. Executing keyword matching fallback.")
     except Exception as err:
-        logger.warning(f"JSON parsing or LLM call failed ({err}). Executing keyword matching fallback.")
-        return _parse_reply_keyword_fallback(text)
+        logger.warning(f"LLM call failed ({err}). Executing keyword matching fallback.")
+    return _parse_reply_keyword_fallback(text)
+
 
 def _parse_reply_keyword_fallback(text: str) -> Dict[str, Any]:
     """
     Deterministic rule-based keyword matcher fallback.
     Prevents pipeline failures on malformed LLM output.
     """
-    lower_text = text.lower()
-
-    # Decline keywords
-    decline_words = ["no", "cancel", "decline", "dont", "don't", "refuse", "stop", "nevermind", "won't", "wont", "not home"]
-    if any(w in lower_text for w in decline_words):
-        return {"wants_reschedule": False, "new_slot": None, "declined": True}
-
-    # Reschedule keywords / phrases
-    reschedule_words = ["yes", "yeah", "yep", "sure", "ok", "okay", "tomorrow", "reschedule", "work", "works", "2pm", "3pm", "10am", "later"]
-    if any(re.search(r'\b' + re.escape(word) + r'\b', lower_text) for word in reschedule_words):
-        # Extract potential slot hint
-        slot = None
-        if "tomorrow" in lower_text:
-            if "2pm" in lower_text or "2 pm" in lower_text:
-                slot = "Tomorrow 2:00 PM"
-            elif "3pm" in lower_text or "3 pm" in lower_text:
-                slot = "Tomorrow 3:00 PM"
-            else:
-                slot = "Tomorrow"
-        elif "2pm" in lower_text or "2 pm" in lower_text:
-            slot = "2:00 PM"
-        elif "3pm" in lower_text or "3 pm" in lower_text:
-            slot = "3:00 PM"
-
-        return {
-            "wants_reschedule": True,
-            "new_slot": slot or "Reschedule Requested",
-            "declined": False
-        }
-
-    # Default fallback if ambiguous
-    return {"wants_reschedule": False, "new_slot": None, "declined": False}
+    return parse_reply_keywords(text)

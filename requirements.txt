@@ -1,0 +1,15 @@
+# Agent core
+langgraph>=0.2
+python-dotenv>=1.0
+requests>=2.31
+
+# LLM providers (Gemini via the current google-genai SDK; OpenRouter / any OpenAI-compatible API)
+google-genai>=1.20
+openai>=1.40
+
+# Dashboard
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# Optional: vector retrieval for the exception analyzer (a keyword retriever is used without it)
+# chromadb>=0.5
