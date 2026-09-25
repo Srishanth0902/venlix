@@ -717,6 +717,11 @@ function renderHealth() {
   else if (active === "offline") { pillText.textContent = "Offline mode"; dot.className = "dot warning"; }
   else { pillText.textContent = "No LLM configured"; dot.className = "dot critical"; }
   $("#offline-banner").hidden = active !== "offline";
+  if (state.health.host === "vercel") {
+    $("#offline-fix").replaceChildren("Add ", h("code", {}, "GEMINI_API_KEY"), " or ", h("code", {}, "OPENROUTER_API_KEY"),
+      " in Vercel → Settings → Environment Variables, then redeploy, to answer any question. ",
+      h("code", {}, ".env.example"), " is only a template and is never read.");
+  }
   renderSystem();
 }
 

@@ -19,7 +19,7 @@ OFFLINE_NOTICE = (
     "I'm running in **offline mode** (no LLM provider is configured or reachable), so I can only "
     "answer from the platform's data, arithmetic and date/time questions.\n\n"
     "To get answers to *any* question, add `GEMINI_API_KEY` (or `OPENROUTER_API_KEY`) to your `.env` "
-    "file and restart the dashboard."
+    "file and restart the dashboard, or on Vercel to the project's environment variables and redeploy."
 )
 
 # ---------------------------------------------------------------------------

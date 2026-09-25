@@ -6,7 +6,7 @@ gateway for all LLM interactions across the system; stream_llm() is its
 streaming twin used by the dashboard chat.
 
 Provider chain (the first provider that answers wins):
-  1. Google Gemini via the google-genai SDK        -> GEMINI_API_KEY
+  1. Google Gemini via the google-genai SDK        -> GEMINI_API_KEY (or GOOGLE_API_KEY)
   2. OpenRouter or any OpenAI-compatible endpoint  -> OPENROUTER_API_KEY (+ OPENROUTER_BASE_URL)
   3. Offline synthesizer (data-grounded, no key)   -> ALLOW_MOCK_FALLBACK=true (default)
 
@@ -76,6 +76,15 @@ def _is_valid_key(key: Optional[str]) -> bool:
     placeholder_terms = ["your_", "placeholder", "here", "xxx", "change_me"]
     key_lower = key.strip().lower()
     return not any(term in key_lower for term in placeholder_terms)
+
+
+def _gemini_key() -> Optional[str]:
+    """GEMINI_API_KEY, or GOOGLE_API_KEY: the name Google's SDKs use, and what hosts are often given."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        key = _env(name)
+        if _is_valid_key(key):
+            return key
+    return None
 
 
 def _allow_offline() -> bool:
@@ -163,7 +172,7 @@ def reset_llm_metrics() -> None:
 
 def get_provider_status() -> Dict[str, Any]:
     """Which providers are configured, and which one will answer first."""
-    gemini_ok = _is_valid_key(_env("GEMINI_API_KEY"))
+    gemini_ok = _gemini_key() is not None
     openrouter_ok = _is_valid_key(_env("OPENROUTER_API_KEY"))
     chain = [name for name, _, _ in _provider_chain()]
     return {
@@ -373,7 +382,7 @@ def _gemini_try_models(task: Optional[str], meta: Dict[str, Any], attempt_fn: Ca
 
 def _call_gemini(user: str, system: Optional[str], max_tokens: int, timeout: float,
                  history: List[Dict[str, str]], temperature: float, meta: Dict[str, Any]) -> str:
-    client = _gemini_client(_env("GEMINI_API_KEY"), _env("GEMINI_BASE_URL"))
+    client = _gemini_client(_gemini_key(), _env("GEMINI_BASE_URL"))
     contents = _gemini_contents(history, user)
 
     def attempt(model: str, thinking: bool) -> str:
@@ -390,7 +399,7 @@ def _call_gemini(user: str, system: Optional[str], max_tokens: int, timeout: flo
 
 def _stream_gemini(user: str, system: Optional[str], max_tokens: int, timeout: float,
                    history: List[Dict[str, str]], temperature: float, meta: Dict[str, Any]) -> Iterator[str]:
-    client = _gemini_client(_env("GEMINI_API_KEY"), _env("GEMINI_BASE_URL"))
+    client = _gemini_client(_gemini_key(), _env("GEMINI_BASE_URL"))
     contents = _gemini_contents(history, user)
 
     def first_chunk(model: str, thinking: bool):
@@ -487,7 +496,7 @@ StreamFn = Callable[..., Iterator[str]]
 
 def _provider_chain() -> List[Tuple[str, ProviderFn, StreamFn]]:
     chain: List[Tuple[str, ProviderFn, StreamFn]] = []
-    if not FORCE_PRIMARY_FAILURE and _is_valid_key(_env("GEMINI_API_KEY")):
+    if not FORCE_PRIMARY_FAILURE and _gemini_key():
         chain.append(("gemini", _call_gemini, _stream_gemini))
     if _is_valid_key(_env("OPENROUTER_API_KEY")):
         chain.append(("openrouter", _call_openrouter, _stream_openrouter))
@@ -498,8 +507,8 @@ def _no_provider_error(errors: List[str]) -> RuntimeError:
     if errors:
         return RuntimeError("All LLM providers failed: " + " | ".join(errors))
     return RuntimeError(
-        "LLM API Key Configuration Error: Neither GEMINI_API_KEY nor OPENROUTER_API_KEY is configured in .env file. "
-        "Please provide a valid API key (GEMINI_API_KEY or OPENROUTER_API_KEY) in .env to invoke live models."
+        "LLM API Key Configuration Error: Neither GEMINI_API_KEY nor OPENROUTER_API_KEY is set. "
+        "Set one (in .env locally, or in your host's environment variables) to invoke live models."
     )
 
 

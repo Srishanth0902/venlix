@@ -130,6 +130,16 @@ def test_provider_status_reports_chain(fake_llm):
     assert status["active_provider"] == "gemini"
 
 
+def test_google_api_key_works_as_the_gemini_key(fake_llm, monkeypatch):
+    # Hosts are often given the key under Google's SDK name.
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    assert client.get_provider_status()["gemini"]["configured"]
+    assert call_llm_detailed("What is the capital of France?")["provider"] == "gemini"
+    headers = {k.lower(): v for k, v in fake_llm.last("gemini")["headers"].items()}
+    assert headers["x-goog-api-key"] == "test-google-key"
+
+
 # --- Behaviour seen against the live Gemini API -------------------------------------------
 
 def _gemini_models_called(fake_llm):
