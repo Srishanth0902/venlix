@@ -34,7 +34,8 @@ def test_sample_run_covers_every_resolution_path():
     assert gate["resolution_path"] == "customer_contact"
     assert "Arjun Mehta" in gate["customer_message"]
     assert gate["customer_intent"] is not None
-    assert {c["task"] for c in gate["llm_metadata"]["calls"]} == {"sms_draft", "customer_reply_sim", "reply_parse"}
+    # Clear replies are parsed locally, so a case costs two LLM calls, not three
+    assert {c["task"] for c in gate["llm_metadata"]["calls"]} == {"sms_draft", "customer_reply_sim"}
 
     for result in results.values():
         assert result["duration_ms"] is not None and result["completed_at"]

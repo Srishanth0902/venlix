@@ -709,7 +709,10 @@ function renderSystem() {
   const backend = state.health && state.health.backend;
   if (llm) {
     const rows = [
-      ["1", "Google Gemini", llm.gemini.configured ? (llm.gemini.forced_failure ? "Configured (forced off for testing)" : "Configured") : "No GEMINI_API_KEY", llm.gemini.model],
+      ["1", "Google Gemini", llm.gemini.configured ? (llm.gemini.forced_failure ? "Configured (forced off for testing)" : "Configured") : "No GEMINI_API_KEY",
+        `chat: ${(llm.gemini.models || [llm.gemini.model]).join(", ")} · agent tasks: ${(llm.gemini.task_models || []).join(", ")}`
+        + (Object.keys(llm.gemini.cooling_down || {}).length ? ` · rate-limited for now: ${Object.entries(llm.gemini.cooling_down).map(([m, s]) => `${m} (${s}s)`).join(", ")}` : "")
+        + ((llm.gemini.unavailable_models || []).length ? ` · not available to this key: ${llm.gemini.unavailable_models.join(", ")}` : "")],
       ["2", "OpenRouter / OpenAI-compatible", llm.openrouter.configured ? "Configured" : "No OPENROUTER_API_KEY", `${llm.openrouter.models.join(", ")} @ ${llm.openrouter.base_url}`],
       ["3", "Offline engine", llm.offline_fallback ? "Enabled" : "Disabled (ALLOW_MOCK_FALLBACK=false)", "data-grounded, no key needed"],
     ];

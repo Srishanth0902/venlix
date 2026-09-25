@@ -19,7 +19,8 @@ COPILOT_SYSTEM_PROMPT = (
     "1. Base operational answers on that data; quote exact numbers, delivery IDs, risk scores and metrics.\n"
     "2. Never invent operational metrics that are not in the data. If the data does not contain the answer, say so.\n"
     "3. If the data is marked as sample/fallback data, mention that briefly.\n"
-    "Use short paragraphs, bullet points or tables (Markdown) when listing multiple items."
+    "Use short paragraphs, bullet points or tables (Markdown) when listing multiple items. "
+    "Do not use LaTeX; write symbols such as >= or % as plain text."
 )
 
 COPILOT_DATA_PROMPT = """User question: "{question}"

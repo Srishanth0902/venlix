@@ -50,7 +50,9 @@ Live updates arrive over a WebSocket (`/ws`); the REST API is listed in `dashboa
 
 | Problem | Effect | Fix |
 |---|---|---|
-| Used the deprecated `google-generativeai` SDK and the retired `gemini-1.5-flash` model | Every Gemini call failed and silently fell back to canned mock text, so the agent "didn't answer" | Moved to the `google-genai` SDK; default model is `gemini-2.5-flash` (configurable) |
+| Used the deprecated `google-generativeai` SDK and the retired `gemini-1.5-flash` model | Every Gemini call failed and silently fell back to canned mock text, so the agent "didn't answer" | Moved to the `google-genai` SDK. Defaults are Google's `gemini-flash-latest` / `gemini-flash-lite-latest` aliases, which never retire (even `gemini-2.5-flash` is now closed to new keys), and a model that returns 404 is skipped automatically |
+| Agent calls used 5–8 s timeouts | The Gemini API rejects deadlines under 10 s, so every agent LLM call failed | Gemini requests use a deadline of at least 10 s; the per-step `AGENT_LLM_TIMEOUT` still bounds each step |
+| No handling of rate limits or overload | Free-tier keys allow about 5 requests per minute per model, and Gemini often returns 503 "high demand"; either error meant no answer | Each request type tries a list of models (quotas are per model). A 429 puts that model on cooldown for the time Google specifies, a 5xx moves to the next model and gets one more round, and a 401 stops immediately |
 | Gemini 2.5 "thinking" enabled with small token caps | Thinking tokens used up `max_output_tokens`: empty or truncated answers, plus several seconds of extra latency | Thinking budget 0 by default (`GEMINI_THINKING_BUDGET`); automatic retry for models that can't disable thinking |
 | Offline mock echoed the prompt back | The simulated customer reply was literally `"and"` (a regex matched the `<reply> and </reply>` example inside the echo), and every SMS was the canned fallback | New offline engine produces real, context-aware drafts and replies, and honest data-grounded chat answers |
 | Every agent prompt went through the Copilot tool router | Drafting an SMS fetched `/deliveries` and injected JSON into the prompt, replacing the SMS system prompt | Tools only run for Copilot questions (no system prompt), or explicitly with `use_tools=True` |
@@ -72,8 +74,13 @@ Live updates arrive over a WebSocket (`/ws`); the REST API is listed in `dashboa
   0.6 s instead of 2.4 s.
 - **Streaming chat.** The first words appear as soon as the model produces them, and
   the dashboard shows time-to-first-token.
-- **No thinking tokens** by default. Timeouts are enforced on every provider, and SDK
-  clients are cached, not rebuilt per call.
+- **No thinking tokens** by default, with enough output-token headroom that a model which
+  still "thinks" can't return an empty answer. Timeouts are enforced on every provider,
+  and SDK clients are cached, not rebuilt per call.
+- **Right-sized models.** Short agent tasks (SMS drafts, summaries) run on Flash-Lite,
+  about 0.5 s per call in live tests; the Copilot uses Flash.
+- **Fewer LLM calls.** Clear customer replies ("Yes, 5 PM works") are parsed locally;
+  only ambiguous ones go to the LLM. That is 2 calls per case instead of 3.
 - **Backend calls** are cached (`BACKEND_CACHE_TTL`), and a down backend is skipped
   for 30 s rather than timing out on every question.
 - **Provider chain.** Gemini → OpenRouter (several models, tried in order) → offline.
@@ -86,7 +93,8 @@ See [`.env.example`](.env.example). The main settings:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GEMINI_API_KEY` / `GEMINI_MODEL` | – / `gemini-2.5-flash` | Primary provider |
+| `GEMINI_API_KEY` | – | Primary provider. Keep it in `.env` or the environment, never in a committed file: Google disables keys it finds in public repos |
+| `GEMINI_MODEL` / `GEMINI_TASK_MODEL` | `gemini-flash-latest` / `gemini-flash-lite-latest` | Comma-separated models for the Copilot and for agent tasks. List several on a free-tier key to multiply its per-model quota (see `.env.example`) |
 | `GEMINI_THINKING_BUDGET` | `0` | `auto` lets the model think (slower) |
 | `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` / `OPENROUTER_BASE_URL` | – / Llama 3.3 70B free / OpenRouter | Fallback; any OpenAI-compatible API works (Ollama, vLLM, …) |
 | `ALLOW_MOCK_FALLBACK` | `true` | Use the offline engine when no provider answers |

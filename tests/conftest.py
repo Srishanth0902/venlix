@@ -14,6 +14,9 @@ os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["GEMINI_BASE_URL"] = ""
 os.environ["BACKEND_URL"] = "http://127.0.0.1:9"  # closed port: fails fast
 os.environ["ALLOW_MOCK_FALLBACK"] = "true"
+os.environ["GEMINI_MODEL"] = ""
+os.environ["GEMINI_TASK_MODEL"] = ""
+os.environ["GEMINI_RETRY_DELAY"] = "0"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -28,6 +31,7 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("VENLIX_DB_PATH", str(tmp_path / "cases.db"))
     store.reset_singletons()
     client.reset_llm_metrics()
+    client.reset_model_state()
     client.set_force_primary_failure(False)
     copilot.clear_backend_cache()
     yield
@@ -44,6 +48,8 @@ class FakeLLMServer:
         self.openai_text = "Hello from OpenRouter"
         self.gemini_status = 200
         self.gemini_reject_thinking = False
+        self.gemini_generic_thinking_error = False
+        self.gemini_model_errors = {}  # model -> (http code, status, message)
         self.openai_status = 200
         server = self
 
@@ -62,15 +68,28 @@ class FakeLLMServer:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
                 body = json.loads(self.rfile.read(length) or b"{}")
-                server.requests.append({"path": self.path, "body": body})
+                server.requests.append({"path": self.path, "body": body, "headers": dict(self.headers)})
                 if ":generateContent" in self.path or ":streamGenerateContent" in self.path:
                     return self._gemini(body)
                 if self.path.endswith("/chat/completions"):
                     return self._openai(body)
                 self._send(404, json.dumps({"error": "not found"}))
 
+            def _gemini_error(self, code, status, message):
+                return self._send(code, json.dumps({"error": {"code": code, "status": status, "message": message}}))
+
             def _gemini(self, body):
+                model = self.path.split("/models/")[1].split(":")[0]
                 thinking = (body.get("generationConfig") or {}).get("thinkingConfig")
+                # The real API rejects request deadlines under 10 s
+                deadline = self.headers.get("X-Server-Timeout")
+                if deadline and int(deadline) < 10:
+                    return self._gemini_error(400, "INVALID_ARGUMENT",
+                                              f"Manually set deadline {deadline}s is too short. Minimum allowed deadline is 10s.")
+                if model in server.gemini_model_errors:
+                    return self._gemini_error(*server.gemini_model_errors[model])
+                if server.gemini_generic_thinking_error and thinking is not None:
+                    return self._gemini_error(400, "INVALID_ARGUMENT", "Request contains an invalid argument.")
                 if server.gemini_reject_thinking and thinking is not None:
                     return self._send(400, json.dumps({"error": {
                         "code": 400, "status": "INVALID_ARGUMENT",

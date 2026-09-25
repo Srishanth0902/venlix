@@ -14,6 +14,7 @@ Every call is timed and recorded so the dashboard can show latency and
 provider health (see get_llm_metrics()).
 """
 import os
+import re
 import json
 import time
 import logging
@@ -34,7 +35,20 @@ from .prompts import COPILOT_SYSTEM_PROMPT, COPILOT_DATA_PROMPT
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+# Google-maintained aliases that always point at the current Flash / Flash-Lite models, so a
+# retired model version can never take the agent down again (gemini-1.5-flash and then
+# gemini-2.5-flash were both closed to new API keys). They are also appended after any
+# configured models as fallbacks.
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"            # Copilot chat: best quality
+DEFAULT_GEMINI_TASK_MODEL = "gemini-flash-lite-latest"  # short agent tasks: ~4x faster
+# Agent-internal tasks with short, structured outputs; they run on GEMINI_TASK_MODEL.
+FAST_TASKS = {"sms_draft", "customer_reply_sim", "reply_parse", "decision_summary", "exception_analysis"}
+# The Gemini API rejects request deadlines under 10 s ("Minimum allowed deadline is 10s"), and the
+# SDK forwards the timeout as that deadline; shorter agent-step limits are enforced by the agent.
+GEMINI_MIN_TIMEOUT = 10.0
+# Gemini 3.x models may still spend hidden "thought" tokens; a small cap then ends the answer
+# before any text (finish_reason=MAX_TOKENS). Prompts, not the cap, keep answers short.
+GEMINI_MIN_OUTPUT_TOKENS = 1024
 DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -152,7 +166,11 @@ def get_provider_status() -> Dict[str, Any]:
     openrouter_ok = _is_valid_key(_env("OPENROUTER_API_KEY"))
     chain = [name for name, _, _ in _provider_chain()]
     return {
-        "gemini": {"configured": gemini_ok, "model": _env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        "gemini": {"configured": gemini_ok, "model": _gemini_models("chat")[0],
+                   "models": _gemini_models("chat"), "task_models": _gemini_models("sms_draft"),
+                   "unavailable_models": sorted(_unavailable_models),
+                   "cooling_down": {m: round(t - time.monotonic()) for m, t in _quota_cooldown_until.items()
+                                    if t > time.monotonic()},
                    "forced_failure": FORCE_PRIMARY_FAILURE},
         "openrouter": {"configured": openrouter_ok, "models": _openrouter_models(),
                        "base_url": _env("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL)},
@@ -208,22 +226,59 @@ def _gemini_client(api_key: str, base_url: Optional[str] = None):
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(base_url=base_url) if base_url else None)
 
 
+def _split_models(raw: Optional[str]) -> List[str]:
+    return [m.strip() for m in (raw or "").split(",") if m.strip()]
+
+
+# Learned at runtime so the same failing request is never repeated:
+_unavailable_models: set = set()             # 404: retired / not enabled for this key
+_models_without_thinking_off: set = set()     # reject thinking_budget=0 (e.g. Flash-Lite, Pro)
+_quota_cooldown_until: Dict[str, float] = {}  # 429: skip the model until its quota refills
+
+
+def reset_model_state() -> None:
+    _unavailable_models.clear()
+    _models_without_thinking_off.clear()
+    _quota_cooldown_until.clear()
+
+
+def _gemini_models(task: Optional[str]) -> List[str]:
+    """
+    Models to try in order: the configured list for this kind of task and its 'latest' alias,
+    then the other list and alias. Free-tier quotas are per model, so every extra model adds capacity.
+    """
+    chat_models = _split_models(_env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
+    task_models = _split_models(_env("GEMINI_TASK_MODEL", DEFAULT_GEMINI_TASK_MODEL))
+    if task in FAST_TASKS:
+        candidates = task_models + [DEFAULT_GEMINI_TASK_MODEL] + chat_models + [DEFAULT_GEMINI_MODEL]
+    else:
+        candidates = chat_models + [DEFAULT_GEMINI_MODEL] + task_models + [DEFAULT_GEMINI_TASK_MODEL]
+    ordered = [m for m in dict.fromkeys(candidates) if m not in _unavailable_models]
+    now = time.monotonic()
+    ready = [m for m in ordered if _quota_cooldown_until.get(m, 0.0) <= now]
+    # If every model is cooling down, still try them (soonest refill first) rather than give up.
+    return ready or sorted(ordered, key=lambda m: _quota_cooldown_until.get(m, 0.0))
+
+
+def _thinking_off_requested() -> bool:
+    return _env("GEMINI_THINKING_BUDGET", "0").lower() not in ("auto", "default", "none")
+
+
 def _gemini_config(system: Optional[str], max_tokens: int, timeout: float, temperature: float, thinking: bool):
     from google.genai import types
     kwargs: Dict[str, Any] = {
         "system_instruction": system or None,
-        "max_output_tokens": max_tokens,
+        "max_output_tokens": max(max_tokens, GEMINI_MIN_OUTPUT_TOKENS),
         "temperature": temperature,
-        "http_options": types.HttpOptions(timeout=int(timeout * 1000)),
+        "http_options": types.HttpOptions(timeout=int(max(timeout, GEMINI_MIN_TIMEOUT) * 1000)),
         # No tools are passed; disabling AFC avoids its per-call warning and bookkeeping.
         "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
     }
     # Gemini 2.5+ "thinks" by default; thinking tokens count against max_output_tokens
     # and add seconds of latency, which truncated or emptied short answers. Disable it
     # unless the operator opts in (GEMINI_THINKING_BUDGET=auto or a token budget).
-    budget = _env("GEMINI_THINKING_BUDGET", "0")
-    if thinking and budget.lower() not in ("auto", "default", "none"):
-        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=int(budget))
+    if thinking and _thinking_off_requested():
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=int(_env("GEMINI_THINKING_BUDGET", "0")))
     return types.GenerateContentConfig(**kwargs)
 
 
@@ -236,51 +291,122 @@ def _gemini_contents(history: List[Dict[str, str]], user: str) -> List[Dict[str,
     return contents
 
 
+def _error_code(err: Exception) -> Optional[int]:
+    code = getattr(err, "code", None)
+    return code if isinstance(code, int) else None
+
+
 def _is_thinking_config_error(err: Exception) -> bool:
+    # Most models name the setting in the error; Flash-Lite only returns the generic
+    # "Request contains an invalid argument." (other 400s, e.g. a too-short deadline, are real errors).
     message = str(err).lower()
-    return "thinking" in message or "budget" in message
+    return "thinking" in message or "budget" in message or (
+        _error_code(err) == 400 and "request contains an invalid argument" in message)
+
+
+def _is_overloaded(err: Exception) -> bool:
+    """Server-side overload / timeouts: worth one retry after a short pause (unlike quota 429s)."""
+    message = str(err).lower()
+    return _error_code(err) in (500, 502, 503, 504) or "timed out" in message or "timeout" in message
+
+
+def _quota_retry_seconds(err: Exception) -> float:
+    """Seconds until a 429'd model may be used again (from Google's RetryInfo / message)."""
+    match = re.search(r"retry(?:_?delay)?['\"]?\s*(?:in|:)\s*['\"]?(\d+(?:\.\d+)?)s", str(err), re.IGNORECASE)
+    seconds = float(match.group(1)) if match else 20.0
+    return min(max(seconds, 1.0), 120.0)
+
+
+def _short_error(err: Exception) -> str:
+    code, status = _error_code(err), getattr(err, "status", None)
+    message = getattr(err, "message", None) or str(err)
+    return f"{code} {status}: {message}"[:160] if code else str(err)[:160]
+
+
+def _thinking_attempts(model: str) -> Tuple[bool, ...]:
+    if not _thinking_off_requested() or model in _models_without_thinking_off:
+        return (False,)
+    return (True, False)
+
+
+def _gemini_try_models(task: Optional[str], meta: Dict[str, Any], attempt_fn: Callable[[str, bool], Any]) -> Any:
+    """
+    Run attempt_fn(model, thinking) over the model list: a model that rejects thinking_budget=0 is
+    retried without it; a retired model (404) is skipped from then on; a model out of quota (429) is
+    skipped until Google says it refills; overload (5xx) moves to the next model, and if every model
+    was overloaded the list is tried once more after a short pause.
+    """
+    errors: List[str] = []
+    for round_no in range(2):
+        all_overloaded = True
+        for model in _gemini_models(task):
+            meta["model"] = model
+            for thinking in _thinking_attempts(model):
+                try:
+                    result = attempt_fn(model, thinking)
+                    if not thinking and _thinking_off_requested():
+                        _models_without_thinking_off.add(model)
+                    return result
+                except Exception as err:
+                    if thinking and _is_thinking_config_error(err):
+                        continue  # same model, default thinking
+                    if _error_code(err) == 404:
+                        _unavailable_models.add(model)
+                        logger.warning(f"Gemini model {model} is not available to this key; skipping it from now on.")
+                    elif _error_code(err) == 429:
+                        wait = _quota_retry_seconds(err)
+                        _quota_cooldown_until[model] = time.monotonic() + wait
+                        logger.warning(f"Gemini model {model} hit its quota; skipping it for {wait:.0f}s.")
+                    all_overloaded = all_overloaded and _is_overloaded(err)
+                    errors.append(f"{model}: {_short_error(err)}")
+                    if _error_code(err) in (401, 403):
+                        # A rejected / revoked key fails on every model: don't try the rest
+                        raise RuntimeError("; ".join(errors)) from err
+                    break
+        if round_no == 0 and errors and all_overloaded:
+            time.sleep(float(_env("GEMINI_RETRY_DELAY", "0.8")))
+            continue
+        break
+    raise RuntimeError("; ".join(errors) or "No Gemini model available.")
 
 
 def _call_gemini(user: str, system: Optional[str], max_tokens: int, timeout: float,
                  history: List[Dict[str, str]], temperature: float, meta: Dict[str, Any]) -> str:
     client = _gemini_client(_env("GEMINI_API_KEY"), _env("GEMINI_BASE_URL"))
-    model = meta["model"] = _env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
     contents = _gemini_contents(history, user)
-    try:
+
+    def attempt(model: str, thinking: bool) -> str:
         response = client.models.generate_content(
-            model=model, contents=contents, config=_gemini_config(system, max_tokens, timeout, temperature, True))
-    except Exception as err:
-        # Some models (e.g. Pro) cannot disable thinking: retry with the model default.
-        if not _is_thinking_config_error(err):
-            raise
-        response = client.models.generate_content(
-            model=model, contents=contents, config=_gemini_config(system, max_tokens, timeout, temperature, False))
-    text = (response.text or "").strip()
-    if not text:
-        reason = response.candidates[0].finish_reason if response.candidates else "no candidates"
-        raise RuntimeError(f"Empty response from Gemini model (finish_reason={reason}).")
-    return text
+            model=model, contents=contents, config=_gemini_config(system, max_tokens, timeout, temperature, thinking))
+        text = (response.text or "").strip()
+        if not text:
+            reason = response.candidates[0].finish_reason if response.candidates else "no candidates"
+            raise RuntimeError(f"Empty response from Gemini model (finish_reason={reason}).")
+        return text
+
+    return _gemini_try_models(meta.get("task"), meta, attempt)
 
 
 def _stream_gemini(user: str, system: Optional[str], max_tokens: int, timeout: float,
                    history: List[Dict[str, str]], temperature: float, meta: Dict[str, Any]) -> Iterator[str]:
     client = _gemini_client(_env("GEMINI_API_KEY"), _env("GEMINI_BASE_URL"))
-    model = meta["model"] = _env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
     contents = _gemini_contents(history, user)
-    emitted = False
-    for thinking in (True, False):
-        try:
-            config = _gemini_config(system, max_tokens, timeout, temperature, thinking)
-            for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
-                if chunk.text:
-                    emitted = True
-                    yield chunk.text
-            if not emitted:
-                raise RuntimeError("Empty streamed response from Gemini model.")
-            return
-        except Exception as err:
-            if emitted or not thinking or not _is_thinking_config_error(err):
-                raise
+
+    def first_chunk(model: str, thinking: bool):
+        # Open the stream and pull the first text chunk inside the retry loop, so a model that
+        # fails up front falls through to the next one; later chunks are yielded below.
+        stream = iter(client.models.generate_content_stream(
+            model=model, contents=contents, config=_gemini_config(system, max_tokens, timeout, temperature, thinking)))
+        for chunk in stream:
+            if chunk.text:
+                return chunk.text, stream
+        raise RuntimeError("Empty streamed response from Gemini model.")
+
+    text, stream = _gemini_try_models(meta.get("task"), meta, first_chunk)
+    yield text
+    for chunk in stream:
+        if chunk.text:
+            yield chunk.text
 
 
 def _openrouter_models() -> List[str]:
@@ -376,6 +502,31 @@ def _no_provider_error(errors: List[str]) -> RuntimeError:
     )
 
 
+def _friendly_reason(errors: List[str]) -> str:
+    text = " ".join(errors).lower()
+    if "429" in text or "resource_exhausted" in text or "quota" in text:
+        return ("your Gemini API key hit its rate limit (the free tier allows about 5 requests per minute "
+                "per model); it resets within a minute")
+    if "503" in text or "high demand" in text or "overloaded" in text or "504" in text:
+        return "Gemini is overloaded right now"
+    if "401" in text or "403" in text or "api key not valid" in text or "permission" in text:
+        return "the API key was rejected"
+    if "404" in text:
+        return "the configured models are not available to this API key"
+    return errors[0][:140]
+
+
+def _explain_offline(task: str, text: str, errors: List[str]) -> str:
+    """When a configured provider failed, say why in the chat (agent tasks stay clean)."""
+    if task != "chat" or not errors:
+        return text
+    reason = _friendly_reason(errors)
+    if text == offline.OFFLINE_NOTICE:
+        return (f"The live model is unavailable right now: {reason}. Open-ended questions need it, so please "
+                "try again shortly. Meanwhile I can still answer from the platform's data, arithmetic and dates.")
+    return f"{text}\n\n_Answered by the offline engine because {reason}._"
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -407,7 +558,7 @@ def call_llm_detailed(
 
     errors: List[str] = []
     for name, call_fn, _ in _provider_chain():
-        meta: Dict[str, Any] = {"model": ""}
+        meta: Dict[str, Any] = {"model": "", "task": task}
         started = time.perf_counter()
         try:
             text = call_fn(request["user"], request["system"], max_tokens, timeout, history_msgs, temperature, meta)
@@ -424,7 +575,7 @@ def call_llm_detailed(
         raise _no_provider_error(errors)
 
     started = time.perf_counter()
-    text = offline.synthesize(task, prompt, request["api_context"])
+    text = _explain_offline(task, offline.synthesize(task, prompt, request["api_context"]), errors)
     entry = _record("offline", "synthesizer", task, started, ok=True)
     return {"text": text, "provider": "offline", "model": "synthesizer", "latency_ms": entry["latency_ms"],
             "apis_called": request["apis_called"], "errors": errors}
@@ -473,7 +624,7 @@ def stream_llm(
 
     errors: List[str] = []
     for name, _, stream_fn in _provider_chain():
-        meta: Dict[str, Any] = {"model": ""}
+        meta: Dict[str, Any] = {"model": "", "task": task}
         started = time.perf_counter()
         first_token_ms = None
         try:
@@ -499,7 +650,7 @@ def stream_llm(
         return
 
     started = time.perf_counter()
-    text = offline.synthesize(task, prompt, request["api_context"])
+    text = _explain_offline(task, offline.synthesize(task, prompt, request["api_context"]), errors)
     first_token_ms = round((time.perf_counter() - started) * 1000.0, 1)
     for i in range(0, len(text), 48):
         yield {"type": "delta", "text": text[i:i + 48]}
