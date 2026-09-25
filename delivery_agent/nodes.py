@@ -1,58 +1,89 @@
+import os
+import time
 import asyncio
 import traceback
 from typing import Dict, Any, Literal
 from .state import DeliveryCase
 from . import interfaces
+from .llm_manager.client import capture_llm_calls
+from .llm_manager.customer_comm import build_draft_prompt
+from .llm_manager.models import DeliveryCase as CommCase
+
+LLM_STEP_TIMEOUT = float(os.getenv("AGENT_LLM_TIMEOUT", "20"))
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000.0, 1)
+
 
 async def risk_detection_node(state: DeliveryCase) -> Dict[str, Any]:
-    """Pulls context and confirms or adjusts failure_type."""
+    """Pulls context and infers failure_type from the weighted ML risk factors."""
+    started = time.perf_counter()
     try:
-        context = await interfaces.get_delivery_context(state["delivery_id"])
-        
-        # Merge context into state temporarily to run analysis
-        temp_state = dict(state)
-        temp_state["customer_context"] = context["customer_context"]
-        temp_state["driver_context"] = context["driver_context"]
-        
-        # Agent dynamically determines the failure type based on context and locations
-        inferred_failure = await interfaces.analyze_risk_heuristics(temp_state) # type: ignore
-        
+        context = await interfaces.get_delivery_context(state["delivery_id"], state)
+        classification = interfaces.classify_failure(state)
+        inferred_failure = classification["failure_type"]
+        top = ", ".join(f"{f['factor']} ({f['weight']:.0f})" for f in classification["factors"][:3]) or "no scored factors"
+
         return {
             "customer_context": context["customer_context"],
             "driver_context": context["driver_context"],
             "failure_type": inferred_failure,
+            "failure_confidence": classification["confidence"],
+            "started_at": state.get("started_at") or time.time(),
             "trace": [
                 {"node": "risk_detection", "action": "Pulled context from DB"},
-                {"node": "risk_detection", "action": f"Analyzed locations and context. Deduced failure_type: {inferred_failure}"}
+                {"node": "risk_detection",
+                 "action": f"Weighed risk factors [{top}]. Deduced failure_type: {inferred_failure} "
+                           f"(confidence {classification['confidence']:.0%})",
+                 "ms": _elapsed_ms(started)},
             ]
         }
     except Exception as e:
         return {
             "status": "escalated",
+            "started_at": state.get("started_at") or time.time(),
             "trace": [{"node": "risk_detection", "action": "Failed to pull context", "error": str(e)}]
         }
+
 
 def route_resolution(state: DeliveryCase) -> Literal["deterministic_resolution_node", "llm_resolution_node", "escalation_node", "manager_node"]:
     """Conditional edge router based on failure_type or status."""
     if state.get("status") == "escalated":
         return "manager_node"
-        
+
     failure_type = state.get("failure_type")
-    
+
     if failure_type == "fraud":
         return "escalation_node"
-    else:
-        return "llm_resolution_node"
+    if failure_type == "driver_delay":
+        # Driver-side problems are fixed operationally (reassign / re-route), no customer contact needed
+        return "deterministic_resolution_node"
+    # access_issue, address_issue, customer_unavailable -> talk to the customer
+    return "llm_resolution_node"
+
 
 async def deterministic_resolution_node(state: DeliveryCase) -> Dict[str, Any]:
     """Handles resolution without LLM, e.g., reassigning driver."""
+    started = time.perf_counter()
     try:
-        # Simulate plain python logic for nearby idle driver
-        await asyncio.sleep(0.1)
+        driver_context = state.get("driver_context") or {}
+        actions = [a.get("action") for a in (state.get("ai_recommendation") or {}).get("recommended_actions") or []
+                   if isinstance(a, dict) and a.get("action")]
+        if driver_context.get("idle_driver_nearby", True):
+            detail = "Reassigned to nearby idle driver"
+            outcome = "resolved_auto"
+        else:
+            detail = "No idle driver nearby; re-routed current driver around congestion and pushed new ETA"
+            outcome = "rerouted"
+        trace = [{"node": "deterministic_resolution", "action": f"{detail} without LLM call", "ms": _elapsed_ms(started)}]
+        if actions:
+            trace.append({"node": "deterministic_resolution", "action": f"Applied ML recommended actions: {', '.join(actions)}"})
         return {
             "resolution_path": "auto_route",
-            "final_outcome": "resolved_auto",
-            "trace": [{"node": "deterministic_resolution", "action": "Reassigned to nearby idle driver without LLM call"}]
+            "resolution_detail": detail,
+            "final_outcome": outcome,
+            "trace": trace,
         }
     except Exception as e:
         return {
@@ -60,97 +91,91 @@ async def deterministic_resolution_node(state: DeliveryCase) -> Dict[str, Any]:
             "trace": [{"node": "deterministic_resolution", "action": "Error routing", "error": str(e)}]
         }
 
+
 async def llm_resolution_node(state: DeliveryCase) -> Dict[str, Any]:
-    """Handles LLM-based customer contact with a dynamic prompt generated by the agent."""
-    try:
-        # Dynamically generate the problem prompt based on the state
-        customer_data = state.get("customer") or {}
-        customer_name = customer_data.get("name", "Customer")
-        
-        failure_type = state.get("failure_type") or "unknown issue"
-        
-        driver_data = state.get("driver") or {}
-        driver_status = driver_data.get("status", "delayed")
-        
-        # Extract specific reasons to make the SMS highly context-aware
-        risk_reasons = state.get('risk_reason') or []
-        reasons_text = ", ".join([r for r in risk_reasons if r])
-        if not reasons_text:
-            reasons_text = "Standard delay."
+    """Contacts the customer: LLM-drafted SMS, (simulated) reply, LLM-parsed intent."""
+    comm_case = interfaces.build_customer_case(state)
+    problem_prompt = build_draft_prompt(CommCase.from_dict(comm_case))
+    customer_name = comm_case["customer_name"]
+    slot = comm_case["proposed_slot"]
+    trace = []
 
-        problem_prompt = (
-            f"Here is a delivery failure event: '{failure_type}'. Driver status is: '{driver_status}'.\n"
-            f"Specific details/reason: {reasons_text}\n\n"
-            f"Please draft a unique, context-aware SMS to customer '{customer_name}' offering a reschedule for today at 5 PM. "
-            f"Be creative and explicitly mention the specific details ({reasons_text}) if appropriate.\n\n"
-            f"IMPORTANT: Use ONLY standard ASCII characters. Do not use smart quotes, em-dashes, or emojis.\n"
-            f"You MUST wrap your final SMS draft inside <sms> and </sms> tags.\n"
-            f"Example:\n"
-            f"<sms>Hi {customer_name}, we hit some {failure_type} due to {reasons_text}. Can we reschedule for 5 PM?</sms>"
-        )
-
+    with capture_llm_calls() as llm_calls:
         try:
-            message_raw = await asyncio.wait_for(
-                interfaces.ask_llm_manager(
-                    prompt=problem_prompt, 
-                    system_prompt="You are a helpful logistics assistant. STRICTLY NO EXPLANATIONS. NO CHAIN OF THOUGHT. Use standard ASCII. Output ONLY the <sms>...</sms> tag and nothing else."
-                ),
-                timeout=20.0
-            )
-            
-            # Extract content between <sms> tags
-            import re
-            match = re.search(r"<sms>(.*?)</sms>", message_raw, re.DOTALL | re.IGNORECASE)
-            if match:
-                message = match.group(1).strip()
-            else:
-                # Fallback: if it rambles, just try to take the very last sentence
-                message_sentences = [s.strip() for s in message_raw.replace('\n', '. ').split('.') if s.strip()]
-                if len(message_sentences) > 0 and not message_raw.startswith("Error contacting LLM"):
-                    # Give them a decent fallback rather than rambling
-                    message = f"Hi {customer_name}, we ran into an issue with '{failure_type}'. Can we reschedule for 5 PM?"
-                else:
-                    message = f"Hi {customer_name}, we ran into an issue with '{failure_type}'. Can we reschedule for 5 PM?"
-                
-        except asyncio.TimeoutError:
-            message = f"Hi {customer_name}, we ran into an issue with '{failure_type}'. Please reply if 5 PM works for a reschedule."
+            started = time.perf_counter()
+            try:
+                message = await asyncio.wait_for(interfaces.draft_customer_message(state), timeout=LLM_STEP_TIMEOUT)
+            except asyncio.TimeoutError:
+                message = f"Hi {customer_name}, we ran into an issue with your delivery. Please reply if {slot} works for a reschedule."
+                return {
+                    "problem_prompt": problem_prompt,
+                    "customer_message": message,
+                    "resolution_path": "customer_contact",
+                    "resolution_detail": "LLM timed out drafting the SMS; human agent to follow up",
+                    "final_outcome": "escalated_timeout",
+                    "status": "escalated",
+                    "llm_metadata": {"calls": list(llm_calls)},
+                    "trace": [{"node": "llm_resolution", "action": "LLM timed out, used canned fallback string",
+                               "ms": _elapsed_ms(started)}]
+                }
+            trace.append({"node": "llm_resolution", "action": f"Drafted SMS to {customer_name}", "ms": _elapsed_ms(started)})
+
+            # Simulate receiving a reply from the customer dynamically using the LLM!
+            started = time.perf_counter()
+            simulated_reply = await asyncio.wait_for(interfaces.simulate_customer_reply(message), timeout=LLM_STEP_TIMEOUT)
+            trace.append({"node": "llm_resolution", "action": "Received customer reply (simulated)", "ms": _elapsed_ms(started)})
+
+            started = time.perf_counter()
+            intent = await asyncio.wait_for(interfaces.parse_customer_reply(simulated_reply), timeout=LLM_STEP_TIMEOUT)
+            trace.append({"node": "llm_resolution", "action": f"Parsed reply intent: {intent}", "ms": _elapsed_ms(started)})
+        except Exception:
             return {
                 "problem_prompt": problem_prompt,
-                "customer_message": message,
-                "resolution_path": "customer_contact",
-                "final_outcome": "escalated_timeout",
                 "status": "escalated",
-                "trace": [{"node": "llm_resolution", "action": "LLM timed out, used canned fallback string"}]
+                "llm_metadata": {"calls": list(llm_calls)},
+                "trace": trace + [{"node": "llm_resolution", "action": "Unhandled error during LLM path",
+                                   "error": traceback.format_exc()}]
             }
 
-        # Simulate receiving a reply from the customer dynamically using the LLM!
-        simulated_reply = await interfaces.simulate_customer_reply(message)
+    update: Dict[str, Any] = {
+        "problem_prompt": problem_prompt,
+        "customer_message": message,
+        "customer_reply": simulated_reply,
+        "customer_intent": intent,
+        "resolution_path": "customer_contact",
+        "llm_metadata": {"calls": list(llm_calls)},
+    }
+    if intent.get("declined"):
+        update.update(final_outcome="customer_declined", status="escalated",
+                      resolution_detail="Customer declined the reschedule; routed to a human agent")
+    elif intent.get("wants_reschedule"):
+        new_slot = intent.get("new_slot") or slot
+        update.update(final_outcome="rescheduled", resolution_detail=f"Delivery rescheduled to {new_slot}")
+    else:
+        update.update(final_outcome="awaiting_customer", status="escalated",
+                      resolution_detail="Customer reply was unclear; flagged for human follow-up")
+    trace.append({"node": "llm_resolution", "action": f"Outcome: {update['final_outcome']} - {update['resolution_detail']}"})
+    update["trace"] = trace
+    return update
 
-        # Parse customer reply
-        reply_dict = await interfaces.parse_customer_reply(simulated_reply)
-        
-        return {
-            "problem_prompt": problem_prompt,
-            "customer_message": message,
-            "customer_reply": reply_dict.get("parsed_intent", simulated_reply),
-            "resolution_path": "customer_contact",
-            "final_outcome": "resolved_customer",
-            "trace": [{"node": "llm_resolution", "action": f"Dynamically prompted LLM and parsed reply: {reply_dict.get('resolution', 'Customer responded')}"}]
-        }
-    except Exception as e:
-        return {
-            "status": "escalated",
-            "trace": [{"node": "llm_resolution", "action": "Unhandled error during LLM path", "error": traceback.format_exc()}]
-        }
 
 async def escalation_node(state: DeliveryCase) -> Dict[str, Any]:
     """Routes to human escalation queue."""
     return {
         "resolution_path": "escalation",
+        "resolution_detail": f"{(state.get('failure_type') or 'risk').replace('_', ' ').capitalize()} signals detected; "
+                             "sent to the human review queue",
         "final_outcome": "escalated",
         "status": "escalated",
         "trace": [{"node": "escalation", "action": "Routed directly to human escalation"}]
     }
+
+
+PATH_SAVINGS = {
+    "auto_route": {"time_min": 15.0, "fuel_inr": 50.0, "cost_inr": 75.0},
+    "customer_contact": {"time_min": 5.0, "fuel_inr": 10.0, "cost_inr": 20.0},
+}
+
 
 async def manager_node(state: DeliveryCase) -> Dict[str, Any]:
     """Terminal node: Compiles trace, computes savings, writes DB and WS."""
@@ -158,32 +183,31 @@ async def manager_node(state: DeliveryCase) -> Dict[str, Any]:
         # Determine status if not already escalated
         current_status = state.get("status")
         final_status = current_status if current_status == "escalated" else "resolved"
-        
-        # Calculate savings based on resolution path
+
+        # A failed delivery attempt is only avoided when the case was actually resolved
         savings = {"time_min": 0.0, "fuel_inr": 0.0, "cost_inr": 0.0}
-        if state.get("resolution_path") == "auto_route":
-            savings = {"time_min": 15.0, "fuel_inr": 50.0, "cost_inr": 75.0}
-        elif state.get("resolution_path") == "customer_contact":
-            savings = {"time_min": 5.0, "fuel_inr": 10.0, "cost_inr": 20.0}
-            
+        if final_status == "resolved":
+            savings = dict(PATH_SAVINGS.get(state.get("resolution_path"), savings))
+
+        completed_at = time.time()
+        started_at = state.get("started_at") or completed_at
+        duration_ms = round((completed_at - started_at) * 1000.0, 1)
         final_trace = [{"node": "manager", "action": f"Compiled trace, calculated savings, set status to {final_status}"}]
-        
+
         # Create an updated copy of the state manually to pass into interfaces
         state_copy = dict(state)
-        state_copy["status"] = final_status
-        state_copy["savings"] = savings
-        
-        await interfaces.write_agent_log(state_copy) # type: ignore
+        state_copy.update(status=final_status, savings=savings, completed_at=completed_at, duration_ms=duration_ms,
+                          trace=list(state.get("trace") or []) + final_trace)
+
+        await interfaces.write_agent_log(state_copy)  # type: ignore
         await interfaces.broadcast_ws({"event": "case_completed", "case": state_copy})
-        
-        # Propagate the LLM data back to the final state output
+
         return {
             "status": final_status,
             "savings": savings,
+            "completed_at": completed_at,
+            "duration_ms": duration_ms,
             "trace": final_trace,
-            "problem_prompt": state.get("problem_prompt"),
-            "customer_message": state.get("customer_message"),
-            "customer_reply": state.get("customer_reply")
         }
     except Exception as e:
         # Even manager_node can fail, but since it's terminal, we just append to trace

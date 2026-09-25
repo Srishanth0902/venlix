@@ -1,4 +1,5 @@
 
+from functools import lru_cache
 from langgraph.graph import StateGraph, END
 from .state import DeliveryCase
 from .nodes import (
@@ -48,3 +49,9 @@ def create_delivery_graph():
     app = workflow.compile()
     
     return app
+
+
+@lru_cache(maxsize=1)
+def get_delivery_graph():
+    """Compiled graph singleton (compiling on every case wastes time)."""
+    return create_delivery_graph()

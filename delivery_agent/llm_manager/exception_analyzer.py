@@ -3,201 +3,186 @@ Tier 2: RAG Exception Analyzer.
 
 Uses in-process ChromaDB over synthetic delivery exception notes to perform vector retrieval
 of past similar cases, grounding the LLM in historical root causes and suggested solutions.
+ChromaDB is optional: without it, a keyword-overlap retriever is used.
 """
-import os
-import sys
-import site
-import json
+import re
+import time
 import logging
-
-user_site = site.getusersitepackages()
-if user_site not in sys.path:
-    sys.path.insert(0, user_site)
-
-from typing import Dict, Any, List
+import threading
+from typing import Dict, Any, List, Optional
 
 from .client import call_llm
+from .customer_comm import _extract_json_object
 from .prompts import (
     EXCEPTION_ANALYSIS_SYSTEM_PROMPT,
     EXCEPTION_ANALYSIS_USER_PROMPT,
 )
 from .synthetic_data import SYNTHETIC_EXCEPTION_NOTES
 
-import time
-
 logger = logging.getLogger(__name__)
 
 _chroma_collection = None
+_chroma_unavailable = False
+_chroma_lock = threading.Lock()
+
 
 def init_chroma_collection():
     """
-    Pre-warm and initialize ChromaDB in-process collection once at startup/module load.
+    Initialize the ChromaDB in-process collection on first use (not at import time,
+    which used to slow down every import of the agent package).
     Seeds collection with 60 synthetic exception notes.
     """
-    global _chroma_collection
-    if _chroma_collection is not None:
+    global _chroma_collection, _chroma_unavailable
+    if _chroma_collection is not None or _chroma_unavailable:
         return _chroma_collection
 
-    start_t = time.perf_counter()
-    try:
-        import chromadb
-        from chromadb.config import Settings
-        
-        client = chromadb.Client(Settings(anonymized_telemetry=False, is_persistent=False))
-        collection = client.get_or_create_collection(name="exception_notes")
+    with _chroma_lock:
+        if _chroma_collection is not None or _chroma_unavailable:
+            return _chroma_collection
+        start_t = time.perf_counter()
+        try:
+            import chromadb
+            from chromadb.config import Settings
 
-        if collection.count() == 0:
-            documents = [item["note"] for item in SYNTHETIC_EXCEPTION_NOTES]
-            metadatas = [
-                {
-                    "root_cause": item["root_cause"],
-                    "suggested_solution": item["suggested_solution"],
-                    "category": item["category"]
-                }
-                for item in SYNTHETIC_EXCEPTION_NOTES
-            ]
-            ids = [item["id"] for item in SYNTHETIC_EXCEPTION_NOTES]
-
-            collection.add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
-            )
+            client = chromadb.Client(Settings(anonymized_telemetry=False, is_persistent=False))
+            collection = client.get_or_create_collection(name="exception_notes")
+            if collection.count() == 0:
+                collection.add(
+                    documents=[item["note"] for item in SYNTHETIC_EXCEPTION_NOTES],
+                    metadatas=[
+                        {
+                            "root_cause": item["root_cause"],
+                            "suggested_solution": item["suggested_solution"],
+                            "category": item["category"]
+                        }
+                        for item in SYNTHETIC_EXCEPTION_NOTES
+                    ],
+                    ids=[item["id"] for item in SYNTHETIC_EXCEPTION_NOTES],
+                )
             elapsed_ms = (time.perf_counter() - start_t) * 1000.0
-            print(f"[STARTUP] Pre-warmed ChromaDB vector store ({collection.count()} notes seeded) in {elapsed_ms:.2f} ms.")
-
-        _chroma_collection = collection
+            logger.info(f"ChromaDB vector store ready ({collection.count()} notes) in {elapsed_ms:.0f} ms.")
+            _chroma_collection = collection
+        except Exception as err:
+            _chroma_unavailable = True
+            logger.info(f"ChromaDB unavailable ({err}); using keyword-based reference retrieval.")
         return _chroma_collection
-    except Exception as err:
-        logger.warning(f"ChromaDB initialization failed: {err}. Will use keyword-based reference retrieval.")
-        return None
+
 
 def get_chroma_collection():
     return init_chroma_collection()
 
-# Pre-warm at module load
-try:
-    init_chroma_collection()
-except Exception as e:
-    logger.warning(f"Module-level ChromaDB pre-warm skipped: {e}")
 
 def analyze_exception_note(note: str) -> Dict[str, Any]:
-    print(f"[{time.strftime('%H:%M:%S')}] start")
+    """Return {"root_cause", "suggested_solution", "confidence", "references", "retrieval_ms", "llm_ms"}."""
     if not note or not note.strip():
-        print(f"[{time.strftime('%H:%M:%S')}] returning (empty note)")
         return {
             "root_cause": "No exception note provided.",
             "suggested_solution": "Verify driver input and re-submit note.",
-            "confidence": 0.0
+            "confidence": 0.0,
+            "references": [],
         }
 
-    # Timing Step 1: ChromaDB Vector Retrieval
-    print(f"[{time.strftime('%H:%M:%S')}] before chroma embed/query")
     t_retrieval_start = time.perf_counter()
     top_references = _retrieve_top_references(note, k=3)
-    t_retrieval_ms = (time.perf_counter() - t_retrieval_start) * 1000.0
-    print(f"[{time.strftime('%H:%M:%S')}] after chroma query (took {t_retrieval_ms:.2f} ms)")
+    retrieval_ms = round((time.perf_counter() - t_retrieval_start) * 1000.0, 1)
 
-    # Format reference cases for prompt
-    ref_text_list = []
-    for idx, ref in enumerate(top_references, 1):
-        ref_text_list.append(
-            f"Reference Case {idx}:\n"
-            f"  Driver Note: \"{ref['note']}\"\n"
-            f"  Root Cause: {ref['root_cause']}\n"
-            f"  Suggested Solution: {ref['suggested_solution']}\n"
-        )
-    reference_cases_text = "\n".join(ref_text_list)
-
+    reference_cases_text = "\n".join(
+        f"Reference Case {idx}:\n"
+        f"  Driver Note: \"{ref['note']}\"\n"
+        f"  Root Cause: {ref['root_cause']}\n"
+        f"  Suggested Solution: {ref['suggested_solution']}\n"
+        for idx, ref in enumerate(top_references, 1)
+    )
     user_prompt = EXCEPTION_ANALYSIS_USER_PROMPT.format(
         current_note=note,
         reference_cases_text=reference_cases_text
     )
 
-    # Timing Step 2: call_llm Generation Step (5.0s PRD timeout)
-    print(f"[{time.strftime('%H:%M:%S')}] before call_llm")
     t_llm_start = time.perf_counter()
+    result: Optional[Dict[str, Any]] = None
     try:
         raw_response = call_llm(
             prompt=user_prompt,
             system=EXCEPTION_ANALYSIS_SYSTEM_PROMPT,
-            max_tokens=250,
-            timeout=5.0
+            max_tokens=300,
+            timeout=8.0,
+            task="exception_analysis",
         )
-        t_llm_ms = (time.perf_counter() - t_llm_start) * 1000.0
-        print(f"[{time.strftime('%H:%M:%S')}] after call_llm (took {t_llm_ms:.2f} ms)")
-
-        cleaned_str = raw_response.strip()
-        if "```json" in cleaned_str:
-            cleaned_str = cleaned_str.split("```json")[1].split("```")[0].strip()
-        elif "```" in cleaned_str:
-            cleaned_str = cleaned_str.split("```")[1].split("```")[0].strip()
-
-        data = json.loads(cleaned_str)
-
-        print(f"[{time.strftime('%H:%M:%S')}] returning")
-        return {
-            "root_cause": str(data.get("root_cause", "Unspecified root cause.")),
-            "suggested_solution": str(data.get("suggested_solution", "Contact dispatch for resolution.")),
-            "confidence": float(data.get("confidence", 0.85))
-        }
+        data = _extract_json_object(raw_response)
+        if data:
+            result = {
+                "root_cause": str(data.get("root_cause", "Unspecified root cause.")),
+                "suggested_solution": str(data.get("suggested_solution", "Contact dispatch for resolution.")),
+                "confidence": max(0.0, min(1.0, float(data.get("confidence", 0.85)))),
+            }
+        else:
+            logger.warning("Exception analysis response was not valid JSON; using top reference.")
     except Exception as err:
-        t_llm_ms = (time.perf_counter() - t_llm_start) * 1000.0
-        print(f"[{time.strftime('%H:%M:%S')}] after call_llm (LLM failed after {t_llm_ms:.2f} ms: {err})")
-        print(f"[{time.strftime('%H:%M:%S')}] returning (heuristic fallback)")
+        logger.warning(f"Exception analysis LLM call failed ({err}); using top reference.")
+    llm_ms = round((time.perf_counter() - t_llm_start) * 1000.0, 1)
+
+    if result is None:
         if top_references:
             top_ref = top_references[0]
-            return {
-                "root_cause": top_ref["root_cause"],
-                "suggested_solution": top_ref["suggested_solution"],
-                "confidence": 0.82
-            }
-        return {
-            "root_cause": "Delivery exception requiring manual review.",
-            "suggested_solution": "Contact customer via SMS and escalate to human dispatch.",
-            "confidence": 0.75
-        }
+            result = {"root_cause": top_ref["root_cause"], "suggested_solution": top_ref["suggested_solution"],
+                      "confidence": 0.82}
+        else:
+            result = {"root_cause": "Delivery exception requiring manual review.",
+                      "suggested_solution": "Contact customer via SMS and escalate to human dispatch.",
+                      "confidence": 0.75}
+
+    result.update(references=top_references, retrieval_ms=retrieval_ms, llm_ms=llm_ms)
+    return result
+
+
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "of", "at", "in", "on", "is", "was", "for", "with", "but", "no",
+    "not", "it", "by", "be", "as", "from", "that", "this", "has", "had", "are", "were", "driver", "customer",
+}
+
+
+def _tokens(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _STOPWORDS and len(w) > 1}
+
 
 def _retrieve_top_references(note: str, k: int = 3) -> List[Dict[str, str]]:
     """Retrieve top-k similar historical notes from ChromaDB or keyword fallback."""
     collection = get_chroma_collection()
-    
+
     if collection is not None:
         try:
-            results = collection.query(
-                query_texts=[note],
-                n_results=k
-            )
-            retrieved = []
-            if results and "documents" in results and results["documents"]:
+            results = collection.query(query_texts=[note], n_results=k)
+            if results and results.get("documents"):
                 docs = results["documents"][0]
-                metas = results["metadatas"][0] if "metadatas" in results else []
-                for i in range(len(docs)):
-                    meta = metas[i] if i < len(metas) else {}
-                    retrieved.append({
+                metas = (results.get("metadatas") or [[]])[0]
+                return [
+                    {
                         "note": docs[i],
-                        "root_cause": meta.get("root_cause", "Historical delivery exception."),
-                        "suggested_solution": meta.get("suggested_solution", "Follow standard protocol.")
-                    })
-                return retrieved
+                        "root_cause": (metas[i] if i < len(metas) else {}).get("root_cause", "Historical delivery exception."),
+                        "suggested_solution": (metas[i] if i < len(metas) else {}).get("suggested_solution", "Follow standard protocol."),
+                        "category": (metas[i] if i < len(metas) else {}).get("category", ""),
+                    }
+                    for i in range(len(docs))
+                ]
         except Exception as e:
             logger.warning(f"ChromaDB query failed: {e}. Falling back to keyword match.")
 
-    # Fallback keyword match over synthetic data if ChromaDB is unavailable
-    note_lower = note.lower()
-    scored_notes = []
+    # Keyword-overlap fallback (punctuation-insensitive, stopwords removed, weighted by
+    # overlap with the note, root cause and category text).
+    query = _tokens(note)
+    scored = []
     for item in SYNTHETIC_EXCEPTION_NOTES:
-        item_words = set(item["note"].lower().split())
-        query_words = set(note_lower.split())
-        overlap = len(item_words.intersection(query_words))
-        scored_notes.append((overlap, item))
-
-    scored_notes.sort(key=lambda x: x[0], reverse=True)
+        doc = _tokens(item["note"])
+        extra = _tokens(item["root_cause"] + " " + item["category"])
+        score = 2 * len(query & doc) + len(query & extra)
+        scored.append((score, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
     return [
         {
             "note": item["note"],
             "root_cause": item["root_cause"],
-            "suggested_solution": item["suggested_solution"]
+            "suggested_solution": item["suggested_solution"],
+            "category": item["category"],
         }
-        for _, item in scored_notes[:k]
+        for _, item in scored[:k]
     ]

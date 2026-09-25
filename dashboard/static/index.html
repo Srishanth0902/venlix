@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Venlix Agent Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232a78d6'/%3E%3Ctext x='16' y='22' font-family='system-ui' font-size='18' font-weight='700' fill='white' text-anchor='middle'%3EV%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script>
+    try { const t = localStorage.getItem("venlix-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo" aria-hidden="true">V</span><span>Venlix Agent Console</span></div>
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+    <button role="tab" data-tab="cases" aria-selected="false">Cases</button>
+    <button role="tab" data-tab="copilot" aria-selected="false">Copilot</button>
+    <button role="tab" data-tab="exceptions" aria-selected="false">Exception analyzer</button>
+    <button role="tab" data-tab="system" aria-selected="false">System</button>
+  </nav>
+  <div class="status">
+    <span id="provider-pill" class="pill" title="LLM provider that answers first"><span class="dot"></span><span class="pill-text">Checking LLM…</span></span>
+    <span id="live-pill" class="pill" title="Live updates"><span class="dot"></span><span>Live</span></span>
+    <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle light / dark theme">◐</button>
+  </div>
+</header>
+
+<main>
+  <!-- Overview -->
+  <section id="tab-overview" class="tab-panel" role="tabpanel">
+    <div class="toolbar">
+      <button id="run-sample" class="btn primary" type="button">Run sample cases</button>
+      <button id="run-backend" class="btn" type="button">Run backend deliveries</button>
+      <label class="field-inline">Concurrency
+        <select id="concurrency">
+          <option>1</option><option>2</option><option selected>4</option><option>8</option>
+        </select>
+      </label>
+      <span id="run-status" class="muted" aria-live="polite"></span>
+    </div>
+    <div id="offline-banner" class="banner" hidden>
+      <span><strong>Offline mode.</strong> No LLM API key is configured (or reachable), so the agent and Copilot use the
+      built-in offline engine: it answers from platform data, math and dates only. Add <code>GEMINI_API_KEY</code> or
+      <code>OPENROUTER_API_KEY</code> to <code>.env</code> and restart to answer any question.</span>
+    </div>
+    <div class="kpis" id="kpis"></div>
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>Cases by failure type</h2><button class="link-btn" type="button" data-table-toggle="chart-failure">Show table</button></div>
+        <div id="chart-failure"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Cases by outcome</h2><button class="link-btn" type="button" data-table-toggle="chart-outcome">Show table</button></div>
+        <div id="chart-outcome"></div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card"><h2>Live activity</h2><ol id="activity" class="activity"></ol></div>
+      <div class="card"><div class="card-head"><h2>Recent cases</h2><button class="link-btn" type="button" data-goto="cases">All cases</button></div><div id="recent-cases"></div></div>
+    </div>
+  </section>
+
+  <!-- Cases -->
+  <section id="tab-cases" class="tab-panel" role="tabpanel" hidden>
+    <div class="toolbar">
+      <select id="case-filter" aria-label="Filter by status">
+        <option value="all">All statuses</option>
+        <option value="resolved">Resolved</option>
+        <option value="escalated">Escalated</option>
+      </select>
+      <input id="case-search" type="search" placeholder="Search ID, customer, failure type…" aria-label="Search cases">
+      <button id="new-case" class="btn primary" type="button">New case</button>
+      <button id="clear-cases" class="btn danger-ghost" type="button">Clear all</button>
+    </div>
+    <div class="cases-layout">
+      <div class="card"><div class="table-wrap" id="cases-table"></div></div>
+      <aside class="card detail" id="case-detail" aria-live="polite"><p class="muted">Select a case to see what the agent did.</p></aside>
+    </div>
+  </section>
+
+  <!-- Copilot -->
+  <section id="tab-copilot" class="tab-panel" role="tabpanel" hidden>
+    <div class="card chat-card">
+      <div class="chat-log" id="chat-log" aria-live="polite"></div>
+      <div class="suggestions chips" id="suggestions"></div>
+      <form id="chat-form" class="chat-form">
+        <textarea id="chat-input" rows="2" placeholder="Ask anything: operations, a case ID, maths, writing, code… (Enter to send, Shift+Enter for a new line)" aria-label="Message"></textarea>
+        <div class="chat-actions">
+          <label><input type="checkbox" id="stream-toggle" checked> Stream answers</label>
+          <button type="button" id="chat-clear" class="btn">New chat</button>
+          <button type="submit" id="chat-send" class="btn primary">Send</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- Exception analyzer -->
+  <section id="tab-exceptions" class="tab-panel" role="tabpanel" hidden>
+    <div class="grid-2">
+      <div class="card">
+        <h2>Driver exception note</h2>
+        <p class="card-sub">Tier-2 RAG: retrieves similar historical exceptions and asks the LLM for the root cause.</p>
+        <form id="note-form" style="display:flex;flex-direction:column;gap:10px">
+          <textarea id="note-input" rows="5" placeholder="e.g. Gate code not working, security guard won't let me in, customer not answering"></textarea>
+          <div class="chips" id="note-examples"></div>
+          <div><button class="btn primary" type="submit" id="note-submit">Analyze note</button></div>
+        </form>
+      </div>
+      <div class="card" id="note-result"><p class="muted">The root cause, suggested fix and matching historical cases appear here.</p></div>
+    </div>
+  </section>
+
+  <!-- System -->
+  <section id="tab-system" class="tab-panel" role="tabpanel" hidden>
+    <div class="kpis" id="llm-kpis"></div>
+    <div class="grid-2">
+      <div class="card"><h2>LLM provider chain</h2><div id="provider-chain"></div></div>
+      <div class="card">
+        <div class="card-head"><h2>Average LLM latency by provider (ms)</h2><button class="link-btn" type="button" data-table-toggle="chart-latency">Show table</button></div>
+        <div id="chart-latency"></div>
+      </div>
+    </div>
+    <div class="card"><div class="card-head"><h2>Recent LLM calls</h2><button class="link-btn" type="button" id="refresh-llm">Refresh</button></div><div class="table-wrap" id="llm-calls"></div></div>
+  </section>
+</main>
+
+<dialog id="case-dialog" aria-labelledby="case-dialog-title">
+  <form id="case-form" method="dialog">
+    <h2 id="case-dialog-title">Run a custom case</h2>
+    <div class="chips" id="case-presets" aria-label="Presets"></div>
+    <div class="form-grid">
+      <label>Customer name<input type="text" name="customer_name" value="Priya Sharma" required maxlength="80"></label>
+      <label>Phone (optional)<input type="tel" name="phone" maxlength="30"></label>
+      <label>Risk score (0–100)<input type="number" name="risk_score" min="0" max="100" value="92" required></label>
+      <label>Proposed slot<input type="text" name="proposed_slot" value="today at 5 PM" maxlength="60"></label>
+      <label class="span-2">Risk factors, one per line as <code>Factor: impact</code>
+        <textarea name="risk_factors" rows="4">High Gate Wait Time: 90
+Customer Response Time: 40</textarea></label>
+      <label class="span-2">Recommended action (optional)<input type="text" name="recommended_action" value="Notify Security Gate" maxlength="80"></label>
+    </div>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="case-cancel">Cancel</button>
+      <button type="submit" class="btn primary" id="case-submit">Run through agent</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<script src="/static/app.js" type="module"></script>
+</body>
+</html>

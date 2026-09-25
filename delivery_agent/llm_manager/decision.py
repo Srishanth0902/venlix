@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def summarize_decision(trace: List[Union[str, Dict[str, Any]]]) -> str:
     """
-    Turns an agent trace into a 2-3 paragraph plain-English explanation for judges and dashboards.
+    Turns an agent trace into a 2-3 sentence plain-English explanation for judges and dashboards.
     """
     if not trace:
         return "No agent trace steps were provided to summarize."
@@ -40,7 +40,8 @@ def summarize_decision(trace: List[Union[str, Dict[str, Any]]]) -> str:
         prompt=user_prompt,
         system=DECISION_SUMMARY_SYSTEM_PROMPT,
         max_tokens=250,
-        timeout=5.0
+        timeout=8.0,
+        task="decision_summary",
     )
 
     return summary.strip()
