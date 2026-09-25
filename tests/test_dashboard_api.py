@@ -72,6 +72,23 @@ def test_case_store_uses_tmp_on_vercel(monkeypatch):
     assert store.get_store().path == os.path.join(tempfile.gettempdir(), "venlix_agent.db")
 
 
+def test_case_store_falls_back_to_tmp_when_path_is_unwritable(monkeypatch, tmp_path):
+    import tempfile
+    from delivery_agent import store
+
+    monkeypatch.setenv("VENLIX_DB_PATH", str(tmp_path / "missing-dir" / "cases.db"))
+    store.reset_singletons()
+    assert store.get_store().path == os.path.join(tempfile.gettempdir(), "venlix_agent.db")
+
+
+def test_vercel_handler_marker_counts_as_vercel(monkeypatch):
+    from delivery_agent import store
+
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.setenv("__VC_HANDLER_ENTRYPOINT", "main.py")
+    assert store.running_on_vercel()
+
+
 def test_backend_run_uses_sample_data_when_backend_is_down(api):
     run = api.post("/api/runs", json={"source": "backend"}).json()
     assert run["total"] == 3 and run["backend_live"] is False
