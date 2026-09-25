@@ -1,0 +1,68 @@
+1
+00:00:00,000 --> 00:00:05,157
+This is Venlix, an AI agent that rescues at-risk deliveries before they fail.
+
+2
+00:00:05,208 --> 00:00:08,317
+Our XGBoost model flags risky deliveries.
+
+3
+00:00:08,287 --> 00:00:11,737
+One click sends them through the LangGraph agent, concurrently.
+
+4
+00:00:11,707 --> 00:00:14,645
+The live feed shows each decision as it happens.
+
+5
+00:00:15,199 --> 00:00:23,940
+Six cases, eighty-three percent resolved without a human, one escalated, and ₹155 and thirty-five minutes saved.
+
+6
+00:00:24,493 --> 00:00:34,151
+A traffic jam in heavy rain is classified as a driver delay, so the agent reassigns a nearby idle driver instantly, with no LLM call.
+
+7
+00:00:34,706 --> 00:00:43,169
+For a gate-access problem, it texts the customer, reads the reply, extracts the new slot, tomorrow at 2 PM, and reschedules.
+
+8
+00:00:43,139 --> 00:00:44,754
+Every step is traced.
+
+9
+00:00:45,307 --> 00:00:48,224
+Fraud signals go straight to a human review queue.
+
+10
+00:00:48,776 --> 00:00:51,607
+Ops teams can also test their own scenario.
+
+11
+00:00:51,577 --> 00:00:55,625
+Pick a preset, like a wrong address, and run it through the agent live.
+
+12
+00:00:56,176 --> 00:01:02,826
+The Operations Copilot answers questions over live data, like which cases were escalated, and why.
+
+13
+00:01:03,382 --> 00:01:09,968
+The exception analyzer turns a messy driver note into a root cause, a fix, and similar past cases.
+
+14
+00:01:10,522 --> 00:01:13,076
+The System tab shows the provider chain:
+
+15
+00:01:13,046 --> 00:01:20,379
+Gemini, OpenRouter, then a built-in offline engine, which runs this entire demo without an API key.
+
+16
+00:01:20,935 --> 00:01:25,153
+Venlix: fewer failed deliveries, lower costs, happier customers.
+
+17
+00:01:25,123 --> 00:01:29,447
+Clone the repo and run it with one command, no API key required.
+
