@@ -370,7 +370,8 @@ function renderDetail(c) {
     explainBtn.disabled = false; explainBtn.textContent = "Re-explain decision";
   });
 
-  box.replaceChildren(
+  // replaceChildren() renders null as the text "null", so drop absent sections.
+  box.replaceChildren(...[
     h("div", { class: "detail-head" }, h("h2", {}, c.delivery_id), statusBadge(c.status)),
     h("div", { class: "muted" }, c.resolution_detail || fmt.label(c.final_outcome)),
     h("div", { class: "facts" },
@@ -409,7 +410,7 @@ function renderDetail(c) {
           h("td", {}, fmt.label(call.task)), h("td", {}, call.provider), h("td", {}, call.model || "–"),
           h("td", { class: "num" }, fmt.ms(call.latency_ms)), h("td", {}, call.ok ? "yes" : `no: ${call.error || ""}`))))))) : null,
     c.problem_prompt ? h("details", { style: "margin-top:14px" }, h("summary", {}, "Prompt sent to the LLM"), h("pre", {}, c.problem_prompt)) : null,
-  );
+  ].filter(Boolean));
   if (factors.length) {
     renderBars("detail-factors", factors.map((f) => ({ label: f.factor, value: Number(f.impact) || 0 })), { valueLabel: "Impact", categoryLabel: "Factor" });
   }
