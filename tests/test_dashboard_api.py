@@ -89,6 +89,31 @@ def test_vercel_handler_marker_counts_as_vercel(monkeypatch):
     assert store.running_on_vercel()
 
 
+def test_unhandled_errors_are_named(monkeypatch):
+    import dashboard.server as server
+
+    def broken_store():
+        raise RuntimeError("disk is read-only")
+
+    monkeypatch.setattr(server, "get_store", broken_store)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        res = client.get("/api/cases")
+    assert res.status_code == 500
+    assert res.json()["detail"] == "RuntimeError: disk is read-only"
+
+
+def test_entrypoint_reports_startup_errors(monkeypatch):
+    import importlib
+    import sys
+
+    monkeypatch.setitem(sys.modules, "dashboard.server", None)  # makes the import fail
+    monkeypatch.delitem(sys.modules, "main", raising=False)
+    entry = importlib.import_module("main")
+    res = TestClient(entry.app).get("/")
+    assert res.status_code == 500 and "Venlix could not start" in res.text
+    sys.modules.pop("main", None)
+
+
 def test_backend_run_uses_sample_data_when_backend_is_down(api):
     run = api.post("/api/runs", json={"source": "backend"}).json()
     assert run["total"] == 3 and run["backend_live"] is False
