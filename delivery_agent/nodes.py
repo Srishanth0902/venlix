@@ -1,4 +1,3 @@
-import os
 import time
 import asyncio
 import traceback
@@ -8,8 +7,9 @@ from . import interfaces
 from .llm_manager.client import capture_llm_calls
 from .llm_manager.customer_comm import build_draft_prompt
 from .llm_manager.models import DeliveryCase as CommCase
+from .env_utils import env_float
 
-LLM_STEP_TIMEOUT = float(os.getenv("AGENT_LLM_TIMEOUT", "20"))
+LLM_STEP_TIMEOUT = env_float("AGENT_LLM_TIMEOUT", 20.0)
 
 
 def _elapsed_ms(started: float) -> float:

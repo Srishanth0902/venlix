@@ -5,7 +5,6 @@ Cases spend most of their time waiting on LLM I/O, so running them concurrently
 (bounded by a semaphore to respect provider rate limits) cuts batch wall-time
 roughly by the concurrency factor.
 """
-import os
 import time
 import asyncio
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -13,8 +12,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from .graph import get_delivery_graph
 from .interfaces import broadcast_ws
 from .state import DeliveryCase
+from .env_utils import env_int
 
-DEFAULT_CONCURRENCY = int(os.getenv("AGENT_CONCURRENCY", "4"))
+DEFAULT_CONCURRENCY = env_int("AGENT_CONCURRENCY", 4)
 
 
 async def run_case(case: DeliveryCase) -> Dict[str, Any]:
