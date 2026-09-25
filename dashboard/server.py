@@ -153,6 +153,7 @@ async def index() -> FileResponse:
 async def health() -> Dict[str, Any]:
     return {
         "status": "ok",
+        "host": "vercel" if running_on_vercel() else "server",
         "llm": get_provider_status(),
         "backend": copilot.get_backend_status(),
         "db_path": get_store().path,

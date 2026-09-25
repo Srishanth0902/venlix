@@ -31,6 +31,12 @@ def test_index_and_health(api):
     health = api.get("/api/health").json()
     assert health["status"] == "ok"
     assert health["llm"]["active_provider"] == "offline"
+    assert health["host"] == "server"
+
+
+def test_health_reports_vercel_so_the_banner_can_say_where_keys_go(api, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    assert api.get("/api/health").json()["host"] == "vercel"
 
 
 def test_sample_run_populates_cases_and_stats(api):

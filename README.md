@@ -89,8 +89,10 @@ Live updates arrive over a WebSocket (`/ws`); the REST API is listed in `dashboa
 
 ## Deploying to Vercel
 
-Import the repository in Vercel. It detects FastAPI through `main.py`, so no build settings are needed. Optionally add
-`GEMINI_API_KEY` and/or `OPENROUTER_API_KEY` as environment variables; without them the offline engine answers.
+Import the repository in Vercel. It detects FastAPI through `main.py`, so no build settings are needed. To use a live
+model, add `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) and/or `OPENROUTER_API_KEY` under Settings → Environment Variables
+and redeploy: Vercel applies variables only to new deployments, and never reads `.env.example`. Without a key the
+offline engine answers.
 
 Serverless functions differ from a normal server, and the app adapts when Vercel's `VERCEL` variable is set:
 
@@ -107,7 +109,7 @@ See [`.env.example`](.env.example). The main settings:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GEMINI_API_KEY` | – | Primary provider. Keep it in `.env` or the environment, never in a committed file: Google disables keys it finds in public repos |
+| `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | – | Primary provider. Keep it in `.env` or the environment, never in a committed file: Google disables keys it finds in public repos |
 | `GEMINI_MODEL` / `GEMINI_TASK_MODEL` | `gemini-flash-latest` / `gemini-flash-lite-latest` | Comma-separated models for the Copilot and for agent tasks. List several on a free-tier key to multiply its per-model quota (see `.env.example`) |
 | `GEMINI_THINKING_BUDGET` | `0` | `auto` lets the model think (slower) |
 | `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` / `OPENROUTER_BASE_URL` | – / Llama 3.3 70B free / OpenRouter | Fallback; any OpenAI-compatible API works (Ollama, vLLM, …) |

@@ -41,9 +41,10 @@
       <span id="run-status" class="muted" aria-live="polite"></span>
     </div>
     <div id="offline-banner" class="banner" hidden>
-      <span><strong>Offline mode.</strong> No LLM API key is configured (or reachable), so the agent and Copilot use the
-      built-in offline engine: it answers from platform data, math and dates only. Add <code>GEMINI_API_KEY</code> or
-      <code>OPENROUTER_API_KEY</code> to <code>.env</code> and restart to answer any question.</span>
+      <span><strong>Offline mode.</strong> No LLM API key is set, so the agent and Copilot use the
+      built-in offline engine: it answers from platform data, math and dates only. <span id="offline-fix">Add
+      <code>GEMINI_API_KEY</code> or <code>OPENROUTER_API_KEY</code> to <code>.env</code> and restart to answer any
+      question.</span></span>
     </div>
     <div class="kpis" id="kpis"></div>
     <div class="grid-2">

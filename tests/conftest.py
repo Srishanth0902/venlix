@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 os.environ["GEMINI_API_KEY"] = ""
+os.environ["GOOGLE_API_KEY"] = ""
 os.environ["OPENROUTER_API_KEY"] = ""
 os.environ["GEMINI_BASE_URL"] = ""
 os.environ["BACKEND_URL"] = "http://127.0.0.1:9"  # closed port: fails fast
