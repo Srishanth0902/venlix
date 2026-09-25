@@ -37,7 +37,7 @@ from pydantic import BaseModel, Field
 from delivery_agent.mapping import map_to_delivery_case, is_at_risk
 from delivery_agent.runner import run_case, run_cases, DEFAULT_CONCURRENCY
 from delivery_agent.sample_data import sample_deliveries
-from delivery_agent.store import get_store, get_event_bus
+from delivery_agent.store import get_store, get_event_bus, running_on_vercel
 from delivery_agent.llm_manager import copilot
 from delivery_agent.llm_manager.client import call_llm_detailed, stream_llm, get_llm_metrics, get_provider_status
 from delivery_agent.llm_manager.decision import summarize_decision
@@ -269,7 +269,7 @@ async def start_run(req: RunRequest) -> Dict[str, Any]:
 def _sync_runs() -> bool:
     """Serverless hosts (Vercel) may pause work after the response and have no WebSockets,
     so there the run completes inside the request. VENLIX_SYNC_RUNS=1 forces this anywhere."""
-    return bool(os.getenv("VERCEL")) or os.getenv("VENLIX_SYNC_RUNS") == "1"
+    return running_on_vercel() or os.getenv("VENLIX_SYNC_RUNS") == "1"
 
 
 @app.get("/api/runs/{run_id}")

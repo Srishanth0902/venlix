@@ -10,9 +10,12 @@ import os
 import json
 import sqlite3
 import asyncio
+import logging
 import tempfile
 import threading
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class CaseStore:
@@ -127,18 +130,37 @@ _bus: Optional[EventBus] = None
 _singleton_lock = threading.Lock()
 
 
+def running_on_vercel() -> bool:
+    """True inside a Vercel function (its Python handler sets __VC_HANDLER_ENTRYPOINT even when
+    the project does not expose Vercel's system environment variables)."""
+    return bool(os.getenv("VERCEL") or os.getenv("__VC_HANDLER_ENTRYPOINT"))
+
+
 def default_db_path() -> str:
     """venlix_agent.db locally; on Vercel only /tmp is writable (and it is per instance)."""
-    if os.getenv("VERCEL"):
+    if running_on_vercel():
         return os.path.join(tempfile.gettempdir(), "venlix_agent.db")
     return "venlix_agent.db"
+
+
+def _open_store() -> CaseStore:
+    path = os.getenv("VENLIX_DB_PATH") or default_db_path()
+    try:
+        return CaseStore(path)
+    except sqlite3.OperationalError:
+        # A read-only deployment directory (serverless hosts) cannot hold the database file.
+        fallback = os.path.join(tempfile.gettempdir(), "venlix_agent.db")
+        if os.path.abspath(path) == os.path.abspath(fallback):
+            raise
+        logger.warning("Cannot open case store at %s; using %s instead", path, fallback)
+        return CaseStore(fallback)
 
 
 def get_store() -> CaseStore:
     global _store
     with _singleton_lock:
         if _store is None:
-            _store = CaseStore(os.getenv("VENLIX_DB_PATH") or default_db_path())
+            _store = _open_store()
         return _store
 
 
